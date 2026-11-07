@@ -43,7 +43,7 @@ func TestCreateDropInputValidate(t *testing.T) {
 }
 
 func TestParseStrategy(t *testing.T) {
-	for _, name := range []string{"naive", "atomic"} {
+	for _, name := range []string{"naive", "atomic", "pessimistic"} {
 		s, err := sale.ParseStrategy(name)
 		if err != nil || s.Name() != name {
 			t.Fatalf("ParseStrategy(%q) = %v, %v", name, s, err)

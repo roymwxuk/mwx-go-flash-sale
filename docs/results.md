@@ -310,3 +310,145 @@ Ceiling (last step with p99 within target and errors below the limit): **500 req
 - **Ceiling still 500 req/s.** At 750 req/s the server completed 562 req/s, the same saturation point as before (554 req/s at the 15:27 run), although each successful reserve now makes about 7 DB round trips instead of 5.
 - This **fits a sharper version of the earlier hypothesis:** the two added round trips (claim key, store response) happen *before* the stock row is locked, and the lock is still held only from the stock UPDATE to COMMIT. So the limit tracks round trips made *while holding the row lock*, not total round trips. Consistent with the data, not proven; a one-statement reserve would be the direct test.
 - At 500 req/s, p99 was 40 ms here vs 394 ms in the 15:27 run, under similar load. Latency at a passing step is sensitive to laptop noise, so the ceiling (pass/fail) is the stable number, not the p99 below it.
+
+---
+
+## L1 burst: 2026-11-07 16:14, commit afb3aea-dirty: 10000 buyers vs 100 units
+
+**Command:** `loadgen -scenario burst -api-bin bin/api -strategies naive,atomic,pessimistic -buyers 10000 -stock 100 -pool 20 -repeat 3`
+
+**Machine:** Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.2, go1.26.5, PostgreSQL 16.15 in Docker (engine VM: 2 CPU / 1.9 GB). Load generator, API, and DB on one machine.
+
+| Strategy | Pool | 201 holds | Oversold (DB) | Violations | 409 sold out | 503 | Other errors | p50 ms | p95 ms | p99 ms | max ms | 201 p95 ms | Throughput req/s | Sell-out ms | H1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| naive | 20 | 1252 | 1152 | 2 | 4387 | 4361 | 0 | 4770.3 | 5248.6 | 5253.6 | 5254.9 | 2306.0 | 1903 | 2458.3 | ok |
+| naive | 20 | 1242 | 1142 | 2 | 2614 | 6144 | 0 | 5097.4 | 5158.1 | 5161.1 | 5161.9 | 2426.2 | 1937 | 2549.9 | ok |
+| naive | 20 | 1599 | 1499 | 2 | 2144 | 6257 | 0 | 5093.0 | 5156.0 | 5162.1 | 5163.0 | 2975.9 | 1937 | 3197.2 | ok |
+| atomic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 2547.4 | 4391.2 | 4566.8 | 4605.4 | 881.2 | 2171 | 892.3 | ok |
+| atomic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 1057.1 | 1920.2 | 2107.5 | 2149.6 | 420.5 | 4652 | 429.4 | ok |
+| atomic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 954.5 | 1794.9 | 1950.1 | 1986.5 | 420.5 | 5034 | 430.4 | ok |
+| pessimistic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 1077.5 | 3179.4 | 3498.4 | 3569.5 | 530.5 | 2802 | 551.1 | ok |
+| pessimistic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 1024.3 | 1586.7 | 1876.4 | 1962.0 | 382.0 | 5097 | 390.6 | ok |
+| pessimistic | 20 | 100 | 0 | 0 | 9900 | 0 | 0 | 1190.5 | 3586.0 | 3917.9 | 3988.5 | 538.7 | 2507 | 546.3 | ok |
+
+Per run (test-plan template):
+
+**naive, run 1** (pool=20, drop 30)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 5.25 s
+- Latency ms: p50 4770.3 · p95 5248.6 · p99 5253.6 · max 5254.9 · 201 only: p50 1556.0 / p95 2306.0 / p99 2421.0 · 409 only: p50 3824.8 / p95 5038.0 / p99 5137.8 · Peak in-flight: 10000
+- Outcome (first attempts): held 1252 · 409 4387 · 503 4361 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 FAIL (oversold by 1152 mid-run), 103 mid-run samples, peak active 1252 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 FAIL (1) · H1 ok
+  - `no_oversell`: held 1252 + confirmed 0 = 1252 > total_stock 100 (oversold by 1152)
+  - `stock_conservation`: remaining 0 + held 1252 + confirmed 0 = 1252 != total_stock 100; surplus: holds without a matching decrement (lost update) or stock released twice
+
+**naive, run 2** (pool=20, drop 31)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 5.16 s
+- Latency ms: p50 5097.4 · p95 5158.1 · p99 5161.1 · max 5161.9 · 201 only: p50 1637.7 / p95 2426.2 / p99 2514.3 · 409 only: p50 3773.2 / p95 4947.8 / p99 5058.5 · Peak in-flight: 10000
+- Outcome (first attempts): held 1242 · 409 2614 · 503 6144 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 FAIL (oversold by 1142 mid-run), 104 mid-run samples, peak active 1242 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 FAIL (1) · H1 ok
+  - `no_oversell`: held 1242 + confirmed 0 = 1242 > total_stock 100 (oversold by 1142)
+  - `stock_conservation`: remaining 0 + held 1242 + confirmed 0 = 1242 != total_stock 100; surplus: holds without a matching decrement (lost update) or stock released twice
+
+**naive, run 3** (pool=20, drop 32)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 5.16 s
+- Latency ms: p50 5093.0 · p95 5156.0 · p99 5162.1 · max 5163.0 · 201 only: p50 1893.0 / p95 2975.9 / p99 3124.7 · 409 only: p50 4090.0 / p95 4957.3 / p99 5035.4 · Peak in-flight: 10000
+- Outcome (first attempts): held 1599 · 409 2144 · 503 6257 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 FAIL (oversold by 1499 mid-run), 103 mid-run samples, peak active 1599 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 FAIL (1) · H1 ok
+  - `no_oversell`: held 1599 + confirmed 0 = 1599 > total_stock 100 (oversold by 1499)
+  - `stock_conservation`: remaining 0 + held 1599 + confirmed 0 = 1599 != total_stock 100; surplus: holds without a matching decrement (lost update) or stock released twice
+
+**atomic, run 1** (pool=20, drop 33)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 4.61 s
+- Latency ms: p50 2547.4 · p95 4391.2 · p99 4566.8 · max 4605.4 · 201 only: p50 723.9 / p95 881.2 / p99 889.4 · 409 only: p50 2571.3 / p95 4393.2 / p99 4567.3 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 92 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**atomic, run 2** (pool=20, drop 34)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 2.15 s
+- Latency ms: p50 1057.1 · p95 1920.2 · p99 2107.5 · max 2149.6 · 201 only: p50 367.2 / p95 420.5 / p99 427.5 · 409 only: p50 1062.7 / p95 1921.9 / p99 2107.5 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 43 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**atomic, run 3** (pool=20, drop 35)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 1.99 s
+- Latency ms: p50 954.5 · p95 1794.9 · p99 1950.1 · max 1986.5 · 201 only: p50 326.1 / p95 420.5 / p99 426.8 · 409 only: p50 959.0 / p95 1797.5 / p99 1950.5 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 39 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**pessimistic, run 1** (pool=20, drop 36)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 3.57 s
+- Latency ms: p50 1077.5 · p95 3179.4 · p99 3498.4 · max 3569.5 · 201 only: p50 425.4 / p95 530.5 / p99 548.8 · 409 only: p50 1080.9 / p95 3184.3 / p99 3499.3 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 71 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**pessimistic, run 2** (pool=20, drop 37)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 1.96 s
+- Latency ms: p50 1024.3 · p95 1586.7 · p99 1876.4 · max 1962.0 · 201 only: p50 301.0 / p95 382.0 / p99 388.8 · 409 only: p50 1028.6 / p95 1587.4 / p99 1877.4 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 40 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**pessimistic, run 3** (pool=20, drop 38)
+- Buyers: 10000 · Stock: 100 · Requests: 10000 (first attempts 10000, dup 0, retries 0, confirms 0) · Duration: 3.99 s
+- Latency ms: p50 1190.5 · p95 3586.0 · p99 3917.9 · max 3988.5 · 201 only: p50 429.7 / p95 538.7 / p99 544.7 · 409 only: p50 1194.7 / p95 3589.6 / p99 3919.0 · Peak in-flight: 10000
+- Outcome (first attempts): held 100 · 409 9900 · 503 0 · other 5xx 0 · transport errors 0 · hung 0
+- Invariants: I1 ok, 79 mid-run samples, peak active 100 · I2 ok · I3 ok · I4 n/a (no expiry until M5) · I5 ok · H1 ok
+
+**Analysis (written by hand):** first run with strategy C (pessimistic, `SELECT ... FOR NO KEY UPDATE` then UPDATE).
+- **Correctness:** pessimistic granted exactly 100 holds in 3/3 runs, with 0 violations, I1 ok at every mid-run sample, and H1 ok. The same as atomic. Naive oversold by 1,142–1,499.
+- **This burst cannot separate B from C on speed.** Only 100 of 10,000 requests per run write; the other 9,900 take the sold-out pre-check, which is identical for both. Atomic p95 1.79–4.39 s, pessimistic 1.59–3.59 s; winners' p95 0.42–0.88 s vs 0.38–0.54 s. The ranges overlap, and atomic's run 1 was a slow outlier for both kinds of request. The write-path ceiling below is the comparison that matters.
+
+---
+
+## L5 capacity ceiling: 2026-11-07 16:15, commit afb3aea-dirty
+
+**Command:** `loadgen -scenario ceiling -api-bin bin/api -strategies atomic,pessimistic -rates 250,500,750,1000 -step 20s -pool 20 -repeat 2`
+
+**Machine:** Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.2, go1.26.5, PostgreSQL 16.15 in Docker (engine VM: 2 CPU / 1.9 GB). Load generator, API, and DB on one machine.
+
+**Strategy atomic, pool 20, drop 39 (stock 51004, never sells out)**
+
+| Target req/s | Sent req/s | Completed req/s | Requests | 201 | 503 | Other errors | Error rate | p50 ms | p95 ms | p99 ms | max ms | Peak in-flight | H1 | Pass |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 250 | 5000 | 5000 | 0 | 0 | 0.00% | 4.7 | 6.2 | 7.8 | 72.6 | 15 | ok | pass |
+| 500 | 500 | 500 | 10000 | 10000 | 0 | 0 | 0.00% | 5.5 | 7.0 | 8.7 | 32.1 | 15 | ok | pass |
+| 750 | 750 | 750 | 15000 | 15000 | 0 | 0 | 0.00% | 6.7 | 9.4 | 23.0 | 90.4 | 38 | ok | pass |
+| 1000 | 1000 | 544 | 20000 | 20000 | 0 | 0 | 0.00% | 5929.8 | 15970.6 | 16611.4 | 16807.7 | 7877 | ok | fail |
+
+Ceiling (last step with p99 within target and errors below the limit): **750 req/s** · Invariants: I1 ok · I2 ok · I5 ok · H1 ok
+
+**Strategy atomic, pool 20, drop 40 (stock 51004, never sells out)**
+
+| Target req/s | Sent req/s | Completed req/s | Requests | 201 | 503 | Other errors | Error rate | p50 ms | p95 ms | p99 ms | max ms | Peak in-flight | H1 | Pass |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 250 | 5000 | 5000 | 0 | 0 | 0.00% | 4.8 | 6.1 | 7.1 | 58.9 | 12 | ok | pass |
+| 500 | 500 | 500 | 10000 | 10000 | 0 | 0 | 0.00% | 5.7 | 7.3 | 10.8 | 94.4 | 28 | ok | pass |
+| 750 | 750 | 750 | 15000 | 15000 | 0 | 0 | 0.00% | 7.1 | 14.7 | 51.3 | 136.2 | 51 | ok | pass |
+| 1000 | 1000 | 536 | 20000 | 20000 | 0 | 0 | 0.00% | 8349.2 | 16471.5 | 17130.9 | 17332.7 | 9156 | ok | fail |
+
+Ceiling (last step with p99 within target and errors below the limit): **750 req/s** · Invariants: I1 ok · I2 ok · I5 ok · H1 ok
+
+**Strategy pessimistic, pool 20, drop 41 (stock 51004, never sells out)**
+
+| Target req/s | Sent req/s | Completed req/s | Requests | 201 | 503 | Other errors | Error rate | p50 ms | p95 ms | p99 ms | max ms | Peak in-flight | H1 | Pass |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 250 | 5000 | 5000 | 0 | 0 | 0.00% | 5.3 | 7.6 | 12.9 | 95.1 | 21 | ok | pass |
+| 500 | 500 | 500 | 10000 | 10000 | 0 | 0 | 0.00% | 6.8 | 9.5 | 19.0 | 90.1 | 29 | ok | pass |
+| 750 | 750 | 421 | 15000 | 5956 | 9044 | 0 | 60.29% | 6932.7 | 14893.4 | 15473.0 | 15631.9 | 6271 | ok | fail |
+
+Ceiling (last step with p99 within target and errors below the limit): **500 req/s** · Invariants: I1 ok · I2 ok · I5 ok · H1 ok
+
+**Strategy pessimistic, pool 20, drop 42 (stock 51004, never sells out)**
+
+| Target req/s | Sent req/s | Completed req/s | Requests | 201 | 503 | Other errors | Error rate | p50 ms | p95 ms | p99 ms | max ms | Peak in-flight | H1 | Pass |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 250 | 5000 | 5000 | 0 | 0 | 0.00% | 5.2 | 7.3 | 12.4 | 79.4 | 15 | ok | pass |
+| 500 | 500 | 460 | 10000 | 10000 | 0 | 0 | 0.00% | 8.7 | 1590.8 | 1741.6 | 1980.8 | 715 | ok | fail |
+
+Ceiling (last step with p99 within target and errors below the limit): **250 req/s** · Invariants: I1 ok · I2 ok · I5 ok · H1 ok
+
+
+**Analysis (written by hand):** write-path ceiling, atomic (B) vs pessimistic (C), 2 runs each, back to back in one session.
+- **Atomic: 750 req/s in both runs. Pessimistic: 500, then 250 req/s.** When overloaded, pessimistic completed 421–460 req/s (with 60% 503s at 750 req/s in run 1). Atomic completed 536–544 req/s at 1,000 req/s.
+- **Why:** both take the same row lock on `drops` and hold it until COMMIT. Atomic takes it in its UPDATE, so the lock is held across UPDATE → COMMIT (2 round trips). Pessimistic takes it in the SELECT, one round trip earlier, so the lock is held across SELECT → UPDATE → COMMIT (3). On a single hot row, lock hold time limits throughput, and the measured gap points the same way. This also supports the round-trips-under-lock hypothesis from the earlier L5 runs.
+- **Across sessions:** atomic passed 750 req/s here but failed it in the 16:01 session (500 ceiling). The laptop varies between sessions, so B vs C is compared only within this session.
+- **Overload reduces goodput:** atomic completed about 750 req/s at the 750 step but only about 540 req/s at the 1,000 step. Past the ceiling, contention makes the system do *less* useful work, not just slower work. Admission control or a waiting room exists to prevent exactly this.

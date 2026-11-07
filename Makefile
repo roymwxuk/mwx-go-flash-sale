@@ -9,7 +9,7 @@ export DATABASE_URL
 BUYERS     ?= 10000
 STOCK      ?= 100
 POOL       ?= 20
-STRATEGIES ?= naive,atomic
+STRATEGIES ?= naive,atomic,pessimistic
 REPEAT     ?= 1
 
 # Messy clients (L6-style): make load-messy (10% double clicks, 30% same-key retries, winners pay, 5% declined)

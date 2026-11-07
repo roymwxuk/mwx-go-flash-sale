@@ -72,7 +72,7 @@ There is no extra dependency or CLI to install. The binary carries its own schem
 
 ## ADR-003: Stock strategies, transaction shape, and isolation level
 
-**Status:** accepted (milestone 2). Strategies A and B are implemented; C (FOR UPDATE) and D (optimistic) come later.
+**Status:** accepted (milestone 2). A and B implemented in milestone 2, C (pessimistic) later. D (optimistic) was cut. The final choice and the numbers are in ADR-007.
 
 ### Context
 Every buyer decrements the same `drops.remaining` row, so this is a single hot row. We want to compare several decrement strategies under identical conditions. Measured results must reflect the strategy, not unrelated differences in the surrounding code.
@@ -111,7 +111,7 @@ The strategy is chosen with `STRATEGY=naive|atomic`. `sale.Service.Reserve` owns
 |---|---|---|
 | A naive | READ COMMITTED | The production default. We want to show the bug that real code with default settings has. |
 | B atomic | READ COMMITTED | Correct as described above. A stronger level would add serialization failures and retries for no gain. |
-| C FOR UPDATE (later) | READ COMMITTED | The explicit row lock gives the guarantee. |
+| C pessimistic | READ COMMITTED | The explicit row lock (`FOR NO KEY UPDATE`, see ADR-007) gives the guarantee. |
 | D optimistic (later) | READ COMMITTED | The version column gives the guarantee, and conflicts are retried in app code. |
 
 **Rejected: SERIALIZABLE for everything.** It would make A correct too, but by aborting conflicting transactions (`40001`), which then need retry loops. On a single hot row almost every transaction conflicts, so throughput would collapse into retries. This is a candidate for an extra measured comparison if time allows.
@@ -235,3 +235,39 @@ The first version of tx1 read the reservation **and** its payment in one stateme
 - `TestPaymentFailureReleasesHold` (C5), `TestConcurrentDeclinedConfirmReleasesOnce`, `TestConfirmAfterExpiryIsRejected` (C8).
 - A mutation test (removing the `status='held'` guard on release) makes the release-once test fail.
 - Load: all winners confirm with 5% declined, and the provider's total charges equal the confirmed reservations (`TestRunMessyClients`). Every invariant held at 10,000 buyers.
+
+---
+
+## ADR-007: Choosing the stock strategy (A vs B vs C)
+
+**Status:** accepted. **Decision: B, the atomic conditional UPDATE.** D (optimistic version column) was cut, per the cut order in the project plan.
+
+### The three candidates (all at READ COMMITTED, same transaction shape; ADR-003)
+| | SQL on the hot row | Lock held on `drops` row | Correct? |
+|---|---|---|---|
+| A. naive | `SELECT remaining` → decide in Go → `UPDATE SET remaining = $abs` | UPDATE → COMMIT, but the read happened *before* the lock | **No:** lost updates |
+| B. atomic | `UPDATE ... SET remaining = remaining - n WHERE id = $1 AND remaining >= n` | UPDATE → COMMIT (2 round trips) | Yes |
+| C. pessimistic | `SELECT remaining ... FOR NO KEY UPDATE` → decide in Go → `UPDATE` | SELECT → UPDATE → COMMIT (3 round trips) | Yes |
+
+### What the numbers showed (`docs/results.md`, runs of 16:14 and 16:15)
+- **Correctness:** in-process, 1,000 goroutines vs 10 units: A oversold in every run; B and C granted exactly 10 every time. Over HTTP, 10,000 buyers vs 100 units, 3 runs each: A oversold by 1,142–1,499; B and C exactly 100, with 0 violations at every mid-run sample.
+- **Burst latency:** B and C can't be told apart. Only 100 of 10,000 requests write, and the rest share the same sold-out pre-check.
+- **Write-path ceiling, same session:** **B 750 req/s (2/2 runs), C 500 and 250 req/s.** Overloaded goodput: B about 540 req/s, C about 420–460 req/s.
+
+### Why B
+1. **Shortest lock hold on the hot row.** The check and the decrement are one statement, so the lock is taken as late as possible. On a single row every buyer has to pass, hold time sets throughput, and B measured higher.
+2. **Simplest correct code.** One statement, with no business decision in Go between the read and the write. "Zero rows affected" means sold out.
+3. **Fewer lock-mode subtleties.** C's first version used `FOR UPDATE` and **deadlocked under load** (999 of 1,000 requests failed with `40P01`, see below). B's plain UPDATE takes the right lock (`FOR NO KEY UPDATE`) implicitly.
+
+### When C would be the better choice
+When the decision needs more than one row or logic that can't be written as a `WHERE` clause. For example: check stock *and* a per-drop budget, read several rows and choose between them, or call business rules in Go with the row held. C locks first and lets Go decide safely. The price is a longer lock hold, so keep the work between SELECT and COMMIT minimal, with no network calls inside it.
+
+### Bug found: `FOR UPDATE` deadlocks with the foreign-key check
+The reserve transaction inserts the reservation *before* taking stock (ADR-003). The INSERT's foreign key (`reservations.drop_id → drops.id`) takes **`FOR KEY SHARE`** on the drop row, so the drop can't be deleted mid-insert. `SELECT ... FOR UPDATE` then requests a lock that **conflicts with other transactions' KEY SHARE**. Two buyers who each hold KEY SHARE and each wait for FOR UPDATE wait on each other, and Postgres aborts one with `deadlock detected`. The barrier test caught it at once: 999 of 1,000 requests failed.
+
+**Fix:** `FOR NO KEY UPDATE`, the mode a plain UPDATE of a non-key column takes. It blocks other writers but not KEY SHARE. It's the lock you actually mean when you're about to change `remaining`. After the fix: 5/5 test runs pass under `-race`.
+
+*Lesson:* `FOR UPDATE` is stronger than most code needs. Unless you're changing a key column or deleting the row, `FOR NO KEY UPDATE` is the right lock, and with foreign keys pointing at the row the stronger mode can deadlock.
+
+### Not chosen: D (optimistic version column with retry)
+Cut for time, as planned. Expectation, not measured: on a single hot row, almost every optimistic attempt conflicts, so retries multiply the load exactly when it's highest. Optimistic concurrency suits low-contention rows, which a flash sale's stock row is not.

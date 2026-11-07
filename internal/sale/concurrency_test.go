@@ -102,25 +102,30 @@ func check(t *testing.T, pool *pgxpool.Pool, dropID int64) invariants.Report {
 func distinctUsers(i int) string { return fmt.Sprintf("user-%d", i) }
 func distinctKeys(i int) string  { return fmt.Sprintf("key-%d", i) }
 
-// Strategy B must never oversell: exactly `stock` winners, everyone else
-// gets a clean sold-out, and the DB passes every invariant.
-func TestConcurrentAtomicNeverOversells(t *testing.T) {
-	pool := testdb.New(t, poolSize)
-	svc, dropID := newDrop(t, pool, "atomic", stock)
+// Strategies B (atomic) and C (pessimistic) must never oversell: exactly
+// `stock` winners, everyone else gets a clean sold-out, and the DB passes
+// every invariant.
+func TestConcurrentCorrectStrategiesNeverOversell(t *testing.T) {
+	for _, strategy := range []string{"atomic", "pessimistic"} {
+		t.Run(strategy, func(t *testing.T) {
+			pool := testdb.New(t, poolSize)
+			svc, dropID := newDrop(t, pool, strategy, stock)
 
-	res := race(t, svc, dropID, buyers, distinctUsers, distinctKeys)
+			res := race(t, svc, dropID, buyers, distinctUsers, distinctKeys)
 
-	if got := res.ok.Load(); got != stock {
-		t.Errorf("successful holds = %d, want exactly %d", got, stock)
+			if got := res.ok.Load(); got != stock {
+				t.Errorf("successful holds = %d, want exactly %d", got, stock)
+			}
+			if got := res.soldOut.Load(); got != buyers-stock {
+				t.Errorf("sold-out responses = %d, want %d", got, buyers-stock)
+			}
+			rep := check(t, pool, dropID)
+			if !rep.OK() {
+				t.Errorf("invariant violations: %+v", rep.Violations)
+			}
+			t.Logf("%s: ok=%d sold_out=%d stats=%+v", strategy, res.ok.Load(), res.soldOut.Load(), rep.Stats)
+		})
 	}
-	if got := res.soldOut.Load(); got != buyers-stock {
-		t.Errorf("sold-out responses = %d, want %d", got, buyers-stock)
-	}
-	rep := check(t, pool, dropID)
-	if !rep.OK() {
-		t.Errorf("invariant violations: %+v", rep.Violations)
-	}
-	t.Logf("atomic: ok=%d sold_out=%d stats=%+v", res.ok.Load(), res.soldOut.Load(), rep.Stats)
 }
 
 // Strategy A is the intentionally broken baseline. This test asserts that it

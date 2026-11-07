@@ -2,7 +2,7 @@
 // drives it over HTTP, verifies invariants directly in Postgres, and records
 // the results. Scenarios follow docs/test-plan.md:
 //
-//	loadgen -scenario burst   -strategies naive,atomic -buyers 10000 -stock 100   # L1
+//	loadgen -scenario burst   -strategies naive,atomic,pessimistic -buyers 10000 -stock 100   # L1
 //	loadgen -scenario ceiling -strategies atomic -rates 500,1000,2000,4000,8000   # L5
 //
 // Exit status is 1 if H1 fails for any strategy (a non-503 5xx, a hung
@@ -75,7 +75,7 @@ func main() {
 	flag.StringVar(&o.scenario, "scenario", "burst", "burst (L1: everyone at once) or ceiling (L5: stepped constant rate)")
 	flag.StringVar(&o.apiBin, "api-bin", "bin/api", "path to the API binary to start for each run")
 	flag.StringVar(&o.databaseURL, "database-url", envOr("DATABASE_URL", "postgres://flashsale:flashsale@localhost:5432/flashsale?sslmode=disable"), "Postgres DSN (API and invariant checker)")
-	flag.StringVar(&strategies, "strategies", "", "comma-separated stock strategies (default: naive,atomic for burst; atomic for ceiling)")
+	flag.StringVar(&strategies, "strategies", "", "comma-separated stock strategies (default: naive,atomic,pessimistic for burst; atomic for ceiling)")
 	flag.IntVar(&o.pool, "pool", 20, "API pgxpool MaxConns (DB_MAX_CONNS)")
 	flag.IntVar(&o.repeat, "repeat", 1, "runs per strategy")
 	flag.DurationVar(&o.serverTimeout, "server-timeout", 5*time.Second, "API REQUEST_TIMEOUT (pool wait included); exceeded → 503")
@@ -108,7 +108,7 @@ func main() {
 	case o.scenario == "ceiling":
 		o.strategies = []string{"atomic"}
 	default:
-		o.strategies = []string{"naive", "atomic"}
+		o.strategies = []string{"naive", "atomic", "pessimistic"}
 	}
 	for _, r := range strings.Split(rates, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(r))

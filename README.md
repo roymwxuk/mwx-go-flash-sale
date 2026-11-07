@@ -2,18 +2,27 @@
 
 A flash-sale API for limited drops (event tickets, limited fan goods) in Go and PostgreSQL. It is built to **prove, with measured numbers, that it never oversells**: 10,000 buyers hit 100 units at the same instant, and no stock is oversold, no buyer is charged twice, and expired holds are released exactly once.
 
-> **Status: milestone 2.** Reservations work with two stock strategies (A naive, B atomic), backed by an invariant checker and barrier-start concurrency tests. Next: the HTTP load generator with latency and throughput numbers.
+> **Status: milestone 3 + test-plan scenarios L1 and L5.** Two stock strategies (A naive, B atomic), an invariant checker, barrier-start concurrency tests, and an HTTP load generator (burst and capacity-ceiling scenarios). Next: idempotency keys, confirm + mock payment (milestone 4), then the main "largest-community drop" scenario L2 once holds expire (milestone 5).
 
-## First result: naive vs atomic (correctness only)
+## Headline results: 10,000 buyers vs 100 units over HTTP
 
-1,000 goroutines released together by a start barrier, racing for **10 units**, repeated 10 times. Full table and machine spec in [`docs/results.md`](docs/results.md).
+Test plan scenario **L1** ([`docs/test-plan.md`](docs/test-plan.md)). Every buyer has a connection open and is released at the same instant. Oversell is counted from the database, and I1 is also sampled every 50 ms *during* the run. 3 runs per strategy, pool of 20 connections. Ranges are min–max across runs. Per-run numbers and analysis are in [`docs/results.md`](docs/results.md) (run of 2026-11-07 15:26).
 
-| Strategy | Runs that oversold | Holds granted per run | Invariant violations |
-|---|---:|---:|---:|
-| A. naive read-then-write | **10 / 10** | 521–728 (for 10 units) | every run |
-| B. atomic conditional UPDATE | **0 / 10** | exactly 10 | 0 |
+| Strategy | Oversold (units) | 201 holds | 503 | p50 | p95 | p99 | Winners (201) p95 | Throughput | H1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A. naive read-then-write | **1,444–2,016** | 1,544–2,116 | 3,067–5,860 | 4.42–5.19 s | 5.20–5.29 s* | 5.20–5.29 s* | 2.62–3.61 s | 1,889–1,921 req/s | ok |
+| B. atomic conditional UPDATE | **0** | **exactly 100** | 0 | 0.74–1.15 s | 1.20–2.13 s | 1.31–2.23 s | 0.37–0.60 s | 4,422–7,489 req/s | ok |
 
-Latency and throughput come in milestone 3 (HTTP load generator).
+Latency covers every response (201, 409, 503). \*Capped by the API's 5 s `REQUEST_TIMEOUT`: slower requests were cut off as 503, so naive's true tail is worse. H1 = no 5xx except 503, no hung requests, no transport errors.
+
+**Capacity ceiling (scenario L5, strategy B):** **500 req/s** of reservation *writes* (stock never sells out) with p99 ≤ 500 ms. At 1,000 req/s the server completed about 554 req/s and the queue grew. For comparison, Postgres alone updated the same kind of single hot row at 4,926 tx/s (pgbench, 20 clients), so the limit is the reserve path's round trips while holding the row lock, not the row. Details in `docs/results.md`.
+
+**Machine:** Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.2, Go 1.26.5, PostgreSQL 16.15 in a Docker VM (2 CPU / 1.9 GB). The load generator, API, and DB all run on one laptop, so the numbers are for comparison, not capacity planning.
+
+What the numbers say:
+- The broken strategy is also the slow one. Lost updates keep stock "available" longer, so more buyers queue on the locked row, the pool saturates, and requests time out as 503. They never hang.
+- With atomic, the winners are the fast ones (p95 0.37–0.60 s). The 9,900 sold-out answers wait behind them for one of 20 DB connections.
+- The in-process concurrency test agrees: with 1,000 goroutines vs 10 units, A oversold in 10/10 runs and B granted exactly 10 in 10/10 runs.
 
 ## Invariants and how they are enforced
 
@@ -42,10 +51,18 @@ Requirements: Go 1.25+, Docker (Compose v2 plugin or standalone `docker-compose`
 make up      # start Postgres 16 and wait until healthy
 make test    # go test -race ./... (integration tests use the compose Postgres)
 make run     # start the API on :8080 (migrates on start)
-make load    # load generator (milestone 3)
+make load          # L1: naive vs atomic, 10,000 buyers vs 100 units; appends to docs/results.md
+make load-ceiling  # L5: stepped constant rate 500→8,000 req/s until p99 > 500 ms or errors ≥ 1%
 ```
 
 `make test-short` runs the unit tests only, with no database.
+
+Load test knobs: `make load BUYERS=1000 STOCK=10 POOL=50 STRATEGIES=atomic REPEAT=3`. `make load` and `make load-ceiling` exit with status 1 if H1 fails, or if any strategy other than `naive` violates an invariant. Raw JSON goes to `results/`.
+
+**OS limits for 10,000 buyers (one machine):**
+- **File descriptors:** each process (loadgen and API) needs about one per buyer. Go raises the soft `ulimit -n` to the hard limit at start-up. On macOS, `kern.maxfilesperproc` (61,440 here) is the real cap. On Linux, check `ulimit -Hn`.
+- **Ephemeral ports:** macOS gives 16,384 (`net.inet.ip.portrange.first`–`last`), so keep `BUYERS` below about 15,000. loadgen closes sockets with `SO_LINGER=0` so back-to-back runs don't run out of ports while old ones sit in TIME_WAIT.
+- **Listen backlog:** `kern.ipc.somaxconn` is 128 on macOS. loadgen opens connections at most 64 at a time before the burst, so the backlog never overflows.
 
 Configuration (environment variables):
 
@@ -66,6 +83,7 @@ See [`docs/decisions.md`](docs/decisions.md):
 - ADR-001: schema, and where each invariant is enforced
 - ADR-002: migrations as embedded plain SQL
 - ADR-003: stock strategies, transaction shape (hot-row lock last), and isolation level
+- ADR-004: load generator design (one pre-opened connection per buyer, fresh API per run, DB as referee)
 
 ## Why `go test -race` is not enough
 

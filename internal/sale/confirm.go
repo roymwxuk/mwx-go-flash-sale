@@ -14,6 +14,11 @@ import (
 
 const confirmEndpoint = "POST /reservations/{id}/confirm"
 
+// paymentWindow is how far a hold's expiry is pushed when its payment
+// starts, so the sweeper cannot expire it while the provider is being called.
+// It only needs to exceed the provider's worst-case latency plus a retry.
+const paymentWindow = 2 * time.Minute
+
 // paymentKey is the idempotency key sent to the provider. It is derived from
 // the reservation, not from the client's Idempotency-Key, so *every* confirm
 // attempt for a reservation (retries, double clicks, different client keys)
@@ -137,10 +142,22 @@ func (s *Service) startPayment(ctx context.Context, id int64, userID string) (ne
 			return ErrHoldExpired
 		}
 		needCharge = true
-		_, err = tx.Exec(ctx, `
+		if _, err = tx.Exec(ctx, `
 			INSERT INTO payments (reservation_id, idempotency_key, status, amount_minor)
 			VALUES ($1, $2, 'pending', $3)
-			ON CONFLICT (reservation_id) DO NOTHING`, id, paymentKey(id), amount)
+			ON CONFLICT (reservation_id) DO NOTHING`, id, paymentKey(id), amount); err != nil {
+			return err
+		}
+		// Give the payment time to finish by pushing the hold's expiry
+		// forward. This is a write to the reservation row *itself*, and that
+		// is the point: a sweeper that took its snapshot before this commit
+		// would not see the pending payment (another table, old snapshot),
+		// but when it locks this row Postgres re-checks `expires_at <= now()`
+		// against the row's newest version and skips it (ADR-008).
+		_, err = tx.Exec(ctx, `
+			UPDATE reservations
+			SET expires_at = GREATEST(expires_at, now() + make_interval(secs => $2))
+			WHERE id = $1`, id, paymentWindow.Seconds())
 		return err
 	})
 	return needCharge, amount, err

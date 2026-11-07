@@ -271,3 +271,42 @@ The reserve transaction inserts the reservation *before* taking stock (ADR-003).
 
 ### Not chosen: D (optimistic version column with retry)
 Cut for time, as planned. Expectation, not measured: on a single hot row, almost every optimistic attempt conflicts, so retries multiply the load exactly when it's highest. Optimistic concurrency suits low-contention rows, which a flash sale's stock row is not.
+
+---
+
+## ADR-008: Expiry sweeper
+
+**Status:** accepted (milestone 5)
+
+### Context
+A hold that is never confirmed must give its stock back after `expires_at`, **exactly once** (invariant I4), even with several API instances each running a sweeper. The sweeper must never expire a hold whose payment is in flight, because the money may already have moved. It also deletes idempotency keys older than 24 h (ADR-005).
+
+### Decision
+- **Where it runs:** a goroutine inside every API instance, ticking every `SWEEP_INTERVAL` (1 s). No separate service: running N instances is the case we design for anyway. On shutdown, the HTTP server drains first, then the sweeper's context is cancelled and `main` waits for its current batch before closing the pool (deferred calls run in reverse order).
+- **One statement per batch, per drop:** a CTE claims up to `SWEEP_BATCH` (500) expired holds of one drop with **`FOR UPDATE SKIP LOCKED`**, flips them `held → expired` (the UPDATE repeats `status = 'held'`), and adds their quantity back to the drop. Claiming, transitioning and refunding commit together.
+- **Exactly once, in three independent layers:**
+  1. **Row lock + SKIP LOCKED:** two sweepers never claim the same row; the second skips it instead of waiting.
+  2. **Status guard:** a row can leave `held` only once, and the refund comes only from rows that actually transitioned.
+  3. **Schema:** `CHECK (remaining <= total_stock)` rejects an over-refund.
+  Mutation tests (below) show what each layer does.
+- **Pending payments are never expired.** `NOT EXISTS (pending payment)`, plus a write to the row itself (next section).
+- **Per drop, not one global batch:** a drop whose stock can't be returned must not block the others (see the bug below).
+
+### Race with confirm, and why confirm extends `expires_at`
+A sweeper's statement takes its snapshot, a confirm then locks the reservation, records a `pending` payment and commits, and *then* the sweeper locks the now-free row. Its `NOT EXISTS (pending payment)` reads **the old snapshot** (another table, so no re-check), sees no payment, and expires the hold. The confirm goes on to charge: money taken, no item. This is the same READ COMMITTED property behind the ADR-006 bug: after a row-lock wait, only the **locked row** is re-read at its newest version.
+
+**Fix:** when confirm starts a payment, it also writes to the reservation row itself: `expires_at = GREATEST(expires_at, now() + 2 min)`. When the sweeper locks that row, Postgres re-checks `expires_at <= now()` against the newest version and skips it. The `NOT EXISTS` check still covers payments pending longer than the window.
+
+### Bug found: one poisoned drop stalled the whole sweeper
+The first version released one batch across all drops, ordered by expiry. Run live against the dev database, it never released anything: the database still held drops oversold by the *naive* strategy in earlier load tests (e.g. 1,599 holds for 100 units). Refunding those would exceed `total_stock`, so the CHECK rejected the statement. The bad rows sorted first on every tick, and the whole sweeper stalled. The tests had missed it because each test gets a fresh, clean database. **Fix:** sweep per drop. A failing drop is skipped and logged at most once a minute (throttled), and the others proceed. Regression test: `TestPoisonedDropDoesNotBlockOthers`.
+
+### Evidence (`docs/results.md`, "Expiry sweeper")
+- `TestConcurrentSweepersReleaseEachHoldOnce` (C7): 200 expired and 50 live holds, 3 sweepers started together with batch size 7. **10/10 runs:** exactly 200 released across sweepers (split differently each run), stock exact, live holds untouched, and a second pass releases nothing.
+- `TestConfirmRacingSweeper`: 150 confirms fired within ±60 ms of their hold's expiry while 3 sweepers poll every 2 ms. **10/10 runs:** every confirm is either 200 (paid, kept) or 410 (not charged); 0 "charged but expired"; charges equal confirmed reservations.
+- Mutation tests: removing confirm's `expires_at` extension makes that test fail with *"reservation has a successful payment but is not confirmed"* (the race is real). Removing the lock and the status guard makes the sweepers attempt double refunds, which the CHECK rejects. Removing only the status guard still passes, because the row lock alone suffices; the guard is a second line of defence.
+
+### Trade-offs and limits
+- **Pending payments that never resolve** (provider outage, and the client never retries) keep their stock held forever. Production needs a reconciliation job that asks the provider for the outcome. Not built.
+- Expired stock comes back up to `SWEEP_INTERVAL` late (1 s). Fine for 5–10 minute holds.
+- The refund UPDATE takes the drop's hot-row lock briefly. One statement per 500 holds keeps that rare.
+- Clock source: `expires_at` and `now()` both come from the DB clock, so app-server clock skew doesn't matter. The tests measure host-to-DB skew (about 13 ms here) only to schedule confirms "around expiry".

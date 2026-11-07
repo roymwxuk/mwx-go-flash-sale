@@ -16,6 +16,7 @@ import (
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/httpapi"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/payment"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/sale"
+	"github.com/roymwxuk/mwx-go-flash-sale/internal/sweeper"
 )
 
 func main() {
@@ -68,9 +69,29 @@ func run(log *slog.Logger) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// The sweeper runs in every API instance; SKIP LOCKED makes N of them
+	// safe (ADR-008). It gets its own cancel so shutdown can stop it after
+	// the HTTP server has drained, and `sweeperDone` lets us wait for its
+	// current batch to finish before the deferred pool.Close runs.
+	sweepCtx, stopSweeper := context.WithCancel(context.Background())
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		sweeper.New(pool, sweeper.Config{
+			Interval:  cfg.SweepInterval,
+			BatchSize: cfg.SweepBatch,
+			KeyTTL:    cfg.KeyTTL,
+		}, log).Run(sweepCtx)
+	}()
+	defer func() {
+		stopSweeper()
+		<-sweeperDone
+	}()
+
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr, "db_max_conns", cfg.DBMaxConns, "strategy", strategy.Name(), "payment_failure_rate", cfg.PaymentFailureRate)
+		log.Info("listening", "addr", cfg.HTTPAddr, "db_max_conns", cfg.DBMaxConns, "strategy", strategy.Name(),
+			"payment_failure_rate", cfg.PaymentFailureRate, "sweep_interval", cfg.SweepInterval)
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -87,5 +108,7 @@ func run(log *slog.Logger) error {
 			return err
 		}
 	}
+	// Deferred calls run in reverse order: stop the sweeper and wait for it,
+	// then pool.Close. Nothing touches the pool after it is closed.
 	return nil
 }

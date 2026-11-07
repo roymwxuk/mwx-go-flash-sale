@@ -452,3 +452,40 @@ Ceiling (last step with p99 within target and errors below the limit): **250 req
 - **Why:** both take the same row lock on `drops` and hold it until COMMIT. Atomic takes it in its UPDATE, so the lock is held across UPDATE → COMMIT (2 round trips). Pessimistic takes it in the SELECT, one round trip earlier, so the lock is held across SELECT → UPDATE → COMMIT (3). On a single hot row, lock hold time limits throughput, and the measured gap points the same way. This also supports the round-trips-under-lock hypothesis from the earlier L5 runs.
 - **Across sessions:** atomic passed 750 req/s here but failed it in the 16:01 session (500 ceiling). The laptop varies between sessions, so B vs C is compared only within this session.
 - **Overload reduces goodput:** atomic completed about 750 req/s at the 750 step but only about 540 req/s at the 1,000 step. Past the ceiling, contention makes the system do *less* useful work, not just slower work. Admission control or a waiting room exists to prevent exactly this.
+
+---
+
+## 2026-11-07 16:30: Expiry sweeper correctness (milestone 5, tests repeated)
+
+**Command:** `go test -race -count=10 -v -run 'TestConcurrentSweepersReleaseEachHoldOnce|TestConfirmRacingSweeper' ./internal/sweeper`. Same machine as above. Each run uses a fresh database.
+
+**C7: 200 expired + 50 live holds, 3 sweepers started together, batch size 7:** passed **10/10**. Holds released per sweeper, per run (always summing to exactly 200):
+`[42 42 116] [112 70 18] [35 102 63] [63 109 28] [14 74 112] [98 67 35] [49 56 95] [63 95 42] [49 32 119] [21 112 67]`.
+Stock was restored exactly, the 50 live holds were untouched, and a second pass released 0.
+
+**Confirm racing the sweeper:** 150 holds (1.5 s TTL), each confirmed at a random moment within ±60 ms of its own expiry, with a 20–80 ms provider and 3 sweepers polling every 2 ms. Passed **10/10**. Outcomes per run:
+
+| Run | Sent after expiry → 410 | Sent before expiry → 200 (paid) | Sent before expiry → 410 (expired while waiting) | Charged but expired |
+|---:|---:|---:|---:|---:|
+| 1 | 86 | 46 | 18 | 0 |
+| 2 | 86 | 61 | 3 | 0 |
+| 3 | 87 | 16 | 47 | 0 |
+| 4 | 86 | 59 | 5 | 0 |
+| 5 | 87 | 45 | 18 | 0 |
+| 6 | 92 | 34 | 24 | 0 |
+| 7 | 90 | 25 | 35 | 0 |
+| 8 | 87 | 50 | 13 | 0 |
+| 9 | 87 | 59 | 4 | 0 |
+| 10 | 87 | 58 | 5 | 0 |
+
+The third column is the race itself: confirms sent before expiry that reached the database after it. Every one was rejected without a charge.
+
+**Mutation checks** (code changed temporarily, then restored):
+
+| Mutation | Result |
+|---|---|
+| Confirm does not extend `expires_at` when payment starts | **Caught:** "reservation 60 has a successful payment but is not confirmed" (charged, not confirmed) |
+| Sweeper without `FOR UPDATE SKIP LOCKED` and without the `status='held'` guard | **Caught:** double refunds attempted, rejected by `CHECK (remaining <= total_stock)` |
+| Only the `status='held'` guard removed | Passes: the row lock plus re-check suffice; the guard is defence in depth |
+
+**Live run (API binary, dev database):** `HOLD_TTL=1s SWEEP_INTERVAL=200ms`, one hold taken over HTTP, back in stock within 1.6 s. The first live run exposed a stall: the dev database held drops oversold by the naive strategy in earlier load runs, and the CHECK correctly refused to refund them. After the per-drop fix, startup sweeps released 111,504 and then 86,022 legitimately expired holds left from earlier load runs, while 14 unrepairable naive drops were each logged once and skipped (ADR-008).

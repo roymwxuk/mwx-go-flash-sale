@@ -2,25 +2,25 @@
 
 A flash-sale API for limited drops (event tickets, limited fan goods) in Go and PostgreSQL. It is built to **prove, with measured numbers, that it never oversells**: 10,000 buyers hit 100 units at the same instant, and no stock is oversold, no buyer is charged twice, and expired holds are released exactly once.
 
-**Why it's hard:** every buyer decrements the same database row. A plain "read stock, then write stock" lets thousands of buyers see the same last unit (measured below: it oversold 100 units by up to 1,499). Retries and double-clicks can charge a card twice, and a background job that releases unpaid holds can return the same unit twice if two copies of it run. This project builds the API, then proves each guarantee with database constraints, concurrency tests, and a load generator that checks the database after every run.
+**Why it's hard:** every buyer decrements the same database row. A plain "read stock, then write stock" lets thousands of buyers see the same last unit (measured below: it oversold 100 units by up to 1,683). Retries and double-clicks can charge a card twice, and a background job that releases unpaid holds can return the same unit twice if two copies of it run. This project builds the API, then proves each guarantee with database constraints, concurrency tests, and a load generator that checks the database after every run.
 
 > **Status:** three stock strategies (A naive, B atomic, C pessimistic), idempotency keys, confirm with a mock payment provider (failure injection), an expiry sweeper safe with N instances, an invariant checker, barrier-start concurrency tests, and an HTTP load generator (burst, messy-client, and capacity-ceiling scenarios). **Not done yet:** CI, and the pool-size comparison (see [Known limitations](#known-limitations)).
 
 ## Headline results: 10,000 buyers vs 100 units over HTTP
 
-Test plan scenario **L1** ([`docs/test-plan.md`](docs/test-plan.md)). Every buyer has a connection open and is released at the same instant. Oversell is counted from the database, and I1 is also sampled every 50 ms *during* the run. 3 runs per strategy, pool of 20 connections. Ranges are min–max across runs. Per-run numbers and analysis are in [`docs/results.md`](docs/results.md) (run of 2026-11-07 16:14).
+Test plan scenario **L1** ([`docs/test-plan.md`](docs/test-plan.md)). Every buyer has a connection open and is released at the same instant. Oversell is counted from the database, and I1 is also sampled every 50 ms *during* the run. 3 runs per strategy, pool of 20 connections. Ranges are min–max across runs. Per-run numbers and analysis are in [`docs/results.md`](docs/results.md) (run of 2026-11-07 18:43, clean commit `eeeb8cc`).
 
 | Strategy | Oversold (units) | 201 holds | 503 | p50 | p95 | p99 | Winners (201) p95 | Throughput | H1 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A. naive read-then-write | **1,142–1,499** | 1,242–1,599 | 4,361–6,257 | 4.77–5.10 s | 5.16–5.25 s* | 5.16–5.25 s* | 2.31–2.98 s | 1,903–1,937 req/s | ok |
-| B. atomic conditional UPDATE | **0** | **exactly 100** | 0 | 0.95–2.55 s | 1.79–4.39 s | 1.95–4.57 s | 0.42–0.88 s | 2,171–5,034 req/s | ok |
-| C. pessimistic `FOR NO KEY UPDATE` | **0** | **exactly 100** | 0 | 1.02–1.19 s | 1.59–3.59 s | 1.88–3.92 s | 0.38–0.54 s | 2,507–5,097 req/s | ok |
+| A. naive read-then-write | **1,373–1,683** | 1,473–1,783 | 4,960–6,317 | 5.12–5.14 s | 5.19–5.26 s* | 5.19–5.27 s* | 2.61–3.38 s | 1,898–1,926 req/s | ok |
+| B. atomic conditional UPDATE | **0** | **exactly 100** | 0 | 0.86–1.18 s | 1.38–2.97 s | 1.55–3.16 s | 0.41–0.59 s | 3,120–6,306 req/s | ok |
+| C. pessimistic `FOR NO KEY UPDATE` | **0** | **exactly 100** | 0 | 1.12–1.36 s | 2.41–3.99 s | 2.72–4.33 s | 0.44–0.65 s | 2,266–3,578 req/s | ok |
 
 Latency covers every response (201, 409, 503). \*Capped by the API's 5 s `REQUEST_TIMEOUT`: slower requests were cut off as 503 (Service Unavailable), so naive's true tail is worse. H1 = no 5xx except 503, no hung requests, no transport errors.
 
-**Messy clients (strategy B, run of 16:01):** the same burst plus 10% double-clicks, 30% same-key retries, and every winner paying with 5% of payments declined. About 14,160 requests per run (983 duplicates, about 3,077 retries). Across 3 runs: **0 keys that produced two different effects**, exactly 100 holds, 0 invariant violations, and 4–10 declined payments whose stock came back. p95 1.96–3.59 s, p99 2.17–3.79 s, winners p95 0.49–0.89 s. Finding: confirm p50 was 2.3–3.5 s although the mock payment takes 100–300 ms, because winners' confirms queue in the same 20-connection pool as about 14,000 losing requests (see `docs/results.md`).
+**Messy clients (strategy B, run of 18:44, commit `eeeb8cc`):** the same burst plus 10% double-clicks, 30% same-key retries, and every winner paying with 5% of payments declined. 14,164–14,169 requests per run (983 duplicates, 3,081–3,086 retries). Across 3 runs: **0 keys that produced two different effects**, exactly 100 holds, 0 invariant violations, and 3–11 declined payments whose stock came back. p95 2.16–4.37 s, p99 2.38–4.57 s, winners p95 0.52–0.84 s. Finding: confirm p50 was 2.35–4.26 s although the mock payment takes 100–300 ms, because winners' confirms queue in the same 20-connection pool as about 14,000 losing requests (see `docs/results.md`).
 
-**B vs C on the write path (L5, same session, 2 runs each):** atomic sustained **750 req/s** in both runs; pessimistic reached **500 and 250 req/s**, because it holds the hot-row lock one round trip longer (SELECT → UPDATE → COMMIT instead of UPDATE → COMMIT). In the burst above they can't be told apart, since only 100 of 10,000 requests write. Decision and reasoning: ADR-007.
+**B vs C on the write path (L5, run of 18:45, commit `eeeb8cc`, 2 runs each):** the ceiling was **500 req/s for atomic in both runs; pessimistic reached 500, then 250**. One step past the ceiling (750 req/s), atomic still completed 551–566 req/s with **0 errors**, while pessimistic completed 402 req/s with **71.5% 503s**. An earlier session (16:15) showed a wider gap (atomic 750 twice, pessimistic 500 and 250). The size of the gap varies by session, but B was never behind C. Why: C holds the hot-row lock one round trip longer (SELECT → UPDATE → COMMIT instead of UPDATE → COMMIT). In the burst above they can't be told apart, since only 100 of 10,000 requests write. Decision and reasoning: ADR-007.
 
 **Capacity ceiling (scenario L5, strategy B), earlier sessions:** **500 req/s** of reservation *writes* (stock never sells out) with p99 ≤ 500 ms, before and after milestone 4. Above it, the server completes only about 554–562 req/s and the queue grows. Postgres alone updated the same kind of single hot row at 4,926 tx/s (pgbench, 20 clients). Milestone 4 added two round trips per reserve, but *before* the row lock, and the ceiling did not move. So the limit tracks round trips made while holding the row lock (consistent with the data, not yet proven). Details in `docs/results.md`.
 
@@ -28,7 +28,7 @@ Latency covers every response (201, 409, 503). \*Capped by the API's 5 s `REQUES
 
 What the numbers say:
 - The broken strategy is also the slow one. Lost updates keep stock "available" longer, so more buyers queue on the locked row, the pool saturates, and requests time out as 503. They never hang.
-- With atomic, the winners are the fast ones (p95 0.42–0.88 s). The 9,900 sold-out answers wait behind them for one of 20 DB connections.
+- With atomic, the winners are the fast ones (p95 0.41–0.59 s). The 9,900 sold-out answers wait behind them for one of 20 DB connections.
 - The in-process concurrency test agrees: with 1,000 goroutines vs 10 units, A oversold in 10/10 runs and B granted exactly 10 in 10/10 runs.
 
 ## Invariants and how they are enforced
@@ -153,7 +153,7 @@ Full ADRs (context, options, decision, why, trade-offs) are in [`docs/decisions.
 | [004](docs/decisions.md#adr-004-load-generator-design) | One pre-opened connection per buyer, fresh API per run, DB is the referee | A client that spreads out the burst flatters the server |
 | [005](docs/decisions.md#adr-005-idempotency-keys) | Key claimed *inside* the effect's transaction; only successes stored | Duplicates are serialized by Postgres with no polling and no lease |
 | [006](docs/decisions.md#adr-006-confirm-and-mock-payment) | Confirm is a re-runnable state machine; provider key = reservation id | No transaction held across a network call, and no double charge |
-| [007](docs/decisions.md#adr-007-choosing-the-stock-strategy-a-vs-b-vs-c) | **B, the atomic conditional UPDATE**; D cut | Shortest lock hold on the hot row: 750 vs 500/250 req/s against C |
+| [007](docs/decisions.md#adr-007-choosing-the-stock-strategy-a-vs-b-vs-c) | **B, the atomic conditional UPDATE**; D cut | Shortest lock hold on the hot row: never behind C; past the ceiling 0% errors vs C's 71.5% 503s |
 | [008](docs/decisions.md#adr-008-expiry-sweeper) | `SKIP LOCKED` sweeper in every instance, per drop | Exactly-once in three independent layers |
 | [009](docs/decisions.md#adr-009-connection-pool-sizing-and-behavior-under-pool-exhaustion) | Pool of 20; one 5 s deadline including the pool wait → 503 | Exhaustion must end in an answer, never a hang |
 | [010](docs/decisions.md#adr-010-the-hot-row-at-100-scale-written-discussion-not-built) | 100× scale: written discussion only | Sold-out reads, not writes, are what grows |
@@ -180,10 +180,10 @@ Written discussion only, not built ([ADR-010]({D}adr-010-the-hot-row-at-100-scal
 
 1. **Answer sold-out before taking a DB connection**: a per-drop "sold out" flag cached for 100–500 ms. It can only say *no*, so it can never cause an oversell; the atomic UPDATE stays the guard.
 2. **Hold the row lock for fewer round trips**: reserve in one statement (CTE or stored function). Our full path tops out at 500–750 req/s, while Postgres alone did 4,926 single-row updates/s in the same VM.
-3. **Admission control / waiting room**: past the ceiling, goodput *fell* (750 → about 540 req/s), so let buyers in at the rate the row can absorb.
+3. **Admission control / waiting room**: past the ceiling, goodput *fell* (16:15 session: 750 → about 540 req/s for atomic; 18:45: pessimistic down to 402 req/s), so let buyers in at the rate the row can absorb.
 4. **Stock buckets (sharded counters)** only for large drops where the write rate itself is the limit; **queue-based allocation** where exact arrival order must decide winners.
 
 ## 日本語サマリー
 
-限定ドロップ（チケット・限定グッズ）向けのフラッシュセールAPIを Go と PostgreSQL で実装し、1万人が100個の在庫に同時アクセスしても売り越さないことを計測で示した。素朴な read-then-write 方式は1,142〜1,499個を売り越した一方、条件付きアトミックUPDATE（採用）と悲観ロックはどの試行でも正確に100個だった。同一セッションの書き込み上限試験ではアトミックUPDATEが750 req/s、悲観ロックが500・250 req/sで、ホット行のロック保持時間の差が出た。冪等キーは効果と同一トランザクションで確保し、二重クリックと再送を含む1回あたり約14,160リクエストで、二重の効果はゼロ。期限切れ予約は `FOR UPDATE SKIP LOCKED` のスイーパー3台で10回中10回、各予約をちょうど1回だけ解放した。
+限定ドロップ（チケット・限定グッズ）向けのフラッシュセールAPIを Go と PostgreSQL で実装し、1万人が100個の在庫に同時アクセスしても売り越さないことを計測で示した。素朴な read-then-write 方式は1,373〜1,683個を売り越した一方、条件付きアトミックUPDATE（採用）と悲観ロックはどの試行でも正確に100個だった。書き込み上限試験では、上限を超えた750 req/sの段でアトミックUPDATEがエラー0件のまま551〜566 req/sを処理した一方、悲観ロックは402 req/sで71.5％が503となり、ホット行のロック保持時間の差が出た。冪等キーは効果と同一トランザクションで確保し、二重クリックと再送を含む1回あたり約14,160リクエストで、二重の効果はゼロ。期限切れ予約は `FOR UPDATE SKIP LOCKED` のスイーパー3台で10回中10回、各予約をちょうど1回だけ解放した。
 

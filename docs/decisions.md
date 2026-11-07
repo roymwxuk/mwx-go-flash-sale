@@ -186,7 +186,7 @@ Clients time out and retry, and users double-click. Every reservation and confir
 ### Evidence
 - `TestIdempotentReserveConcurrentSameKey` (C3): 50 identical requests at the same instant give 1 reservation, 50 byte-identical responses, and 49 replays, under both strategies. A mutation test (removing the key claim) makes it fail.
 - `TestIdempotencyKeyReuseWithDifferentRequest` (C4): different quantity, drop, or endpoint gives 422 with no effect.
-- Load (`make load-messy`, 10,000 buyers): about 14,160 requests per run, including 983 double-clicks and about 3,077 same-key retries, with **0 keys that produced two different successful responses**.
+- Load (`make load-messy`, 10,000 buyers): about 14,160 requests per run, including 983 double-clicks and about 3,080 same-key retries (runs of 16:01 and 18:44), with **0 keys that produced two different successful responses**.
 
 ### Trade-offs
 - A duplicate waiting on the key holds a pool connection for as long as the first transaction runs (a few ms). A storm of same-key duplicates could therefore use up pool connections. Accepted: per-key duplicates are few, and the alternative (polling) costs more queries overall.
@@ -249,10 +249,10 @@ The first version of tx1 read the reservation **and** its payment in one stateme
 | B. atomic | `UPDATE ... SET remaining = remaining - n WHERE id = $1 AND remaining >= n` | UPDATE → COMMIT (2 round trips) | Yes |
 | C. pessimistic | `SELECT remaining ... FOR NO KEY UPDATE` → decide in Go → `UPDATE` | SELECT → UPDATE → COMMIT (3 round trips) | Yes |
 
-### What the numbers showed (`docs/results.md`, runs of 16:14 and 16:15)
-- **Correctness:** in-process, 1,000 goroutines vs 10 units: A oversold in every run; B and C granted exactly 10 every time. Over HTTP, 10,000 buyers vs 100 units, 3 runs each: A oversold by 1,142–1,499; B and C exactly 100, with 0 violations at every mid-run sample.
+### What the numbers showed (`docs/results.md`; clean re-run at 18:43–18:45 on `eeeb8cc`, earlier runs at 16:14–16:15)
+- **Correctness:** in-process, 1,000 goroutines vs 10 units: A oversold in every run; B and C granted exactly 10 every time. Over HTTP, 10,000 buyers vs 100 units, 3 runs each: A oversold by 1,142–1,499 (16:14) and 1,373–1,683 (18:43, clean); B and C exactly 100, with 0 violations at every mid-run sample.
 - **Burst latency:** B and C can't be told apart. Only 100 of 10,000 requests write, and the rest share the same sold-out pre-check.
-- **Write-path ceiling, same session:** **B 750 req/s (2/2 runs), C 500 and 250 req/s.** Overloaded goodput: B about 540 req/s, C about 420–460 req/s.
+- **Write-path ceiling, B vs C in the same session, 2 sessions:** 16:15: **B 750 req/s (2/2 runs), C 500 and 250.** 18:45 (clean commit): **B 500 (2/2), C 500 and 250.** The 750 figure didn't reproduce, so the size of the gap depends on the session. What held in both: B's ceiling was never below C's, and once overloaded B completed more work. In the 18:45 run at 750 req/s, B completed 551–566 req/s with 0 errors, C 402 req/s with 71.5% 503s.
 
 ### Why B
 1. **Shortest lock hold on the hot row.** The check and the decrement are one statement, so the lock is taken as late as possible. On a single row every buyer has to pass, hold time sets throughput, and B measured higher.
@@ -327,8 +327,8 @@ The first version released one batch across all drops, ordered by expiry. Run li
 - Confirm's final DB write runs after the payment call, on `context.WithoutCancel` with its own 5 s timeout (ADR-006). The DB records the provider's outcome even when the client's deadline has already passed.
 
 ### What the measurements show (pool 20 only, `docs/results.md`)
-- **Exhaustion ends in a 503, never a hang.** The naive strategy saturates the pool: lost updates keep stock "available", so thousands of transactions queue on the hot row. That produced 4,361–6,257 503s per run (16:14 run), with p95 capped at about 5.2 s by the deadline, 0 transport errors and 0 hung requests (H1 ok).
-- **With the atomic strategy and 20 connections, 10,000 buyers caused no 503s** in any burst run. The cost shows up as latency: p50 0.95–2.55 s for all requests, while winners (201) had p95 0.42–0.88 s.
+- **Exhaustion ends in a 503, never a hang.** The naive strategy saturates the pool: lost updates keep stock "available", so thousands of transactions queue on the hot row. That produced 4,960–6,317 503s per run (18:43 run), with p95 capped at about 5.2 s by the deadline, 0 transport errors and 0 hung requests (H1 ok).
+- **With the atomic strategy and 20 connections, 10,000 buyers caused no 503s** in any burst run. The cost shows up as latency: p50 0.86–1.18 s for all requests, while winners (201) had p95 0.41–0.59 s (18:43 run).
 - **Write-path ceiling at pool 20:** 500–750 req/s, depending on the session (L5). Postgres alone, in the same VM, ran 4,926 single-row updates/s (pgbench, 20 clients). Going from 1 to 20 pgbench clients *lowered* tps (6,195 → 4,926). More connections on one row add contention, not capacity.
 
 ### Not measured
@@ -353,7 +353,7 @@ A 100-unit drop has only about 100 successful writes, plus a few resales after e
 ### What I would change, in order
 1. **Answer sold-out without the database.** Cache a "sold out" flag per drop in each API process (or a shared cache), refreshed every 100–500 ms, and checked before acquiring a connection. A stale "available" only costs one extra DB trip, because the atomic UPDATE stays the real guard. A stale "sold out" only delays a resale by the refresh interval. This removes about 99% of DB load in the burst.
 2. **Shorten the lock hold.** Do the reserve in one round trip: INSERT reservation + UPDATE stock + store idempotency key in one CTE, or in a stored function. Commit with no network trip between UPDATE and COMMIT. The measured gap between our path (about 550 req/s) and bare Postgres (4,926 tx/s) is mostly round trips made while holding the lock.
-3. **Admission control / waiting room** in front of the reserve endpoint: let buyers in at the rate the stock row can absorb, and hand out queue positions to the rest. The L5 overload result (goodput *falling* from 750 to about 540 req/s past the ceiling) is the reason: without admission control, overload does less useful work, not just slower work.
+3. **Admission control / waiting room** in front of the reserve endpoint: let buyers in at the rate the stock row can absorb, and hand out queue positions to the rest. The L5 overload results are the reason (goodput *falling* from 750 to about 540 req/s past the ceiling in the 16:15 session; pessimistic down to 402 req/s with 71.5% 503s at 18:45): without admission control, overload does less useful work, not just slower work.
 4. **Stock buckets (sharded counters) for large drops:** split `remaining` across N rows (for example 16) and take from a random bucket, falling back to the others when it's empty. Write throughput scales roughly with N. The costs: "sold out" now needs every bucket to be empty, conservation checks sum N rows, and the fallback path adds latency near sell-out. Only worth it when the *write* rate is the limit, i.e. drops of thousands of units.
 5. **Queue-based allocation** (accept requests into a durable queue, and let one consumer decide winners in order). It's fair and has no contention, but the answer becomes asynchronous, which changes the API and the UX. It's the right model when "who arrived first" must be exact.
 

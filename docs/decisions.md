@@ -146,7 +146,7 @@ The load test must show what happens when 10,000 buyers arrive *at the same inst
 4. **The DB is the referee.** "Oversold" in the results comes from `invariants.Check` against Postgres, not from counting HTTP 201s.
 5. **`SO_LINGER=0` on client sockets.** Closing 10,000 sockets normally leaves them in TIME_WAIT (~30 s on macOS). The ephemeral range is only 16,384 ports, and the second run in our first attempt failed with `can't assign requested address`. Linger 0 closes with RST, which is fine for a load generator and wrong for a real client.
 6. **Timeouts:** server `REQUEST_TIMEOUT` = 5 s (pool wait included, then 503). Client timeout = 30 s, so a server 503 is recorded as a 503, not as a client timeout.
-7. **Exit code:** 1 if any strategy except `naive` violates an invariant, or if H1 fails. Naive is expected to fail. This is what a CI smoke test would gate on (CI is not built yet; see the README's limitations).
+7. **Exit code:** 1 if any strategy except `naive` violates an invariant, or if H1 fails. Naive is expected to fail. CI's load smoke test (`.github/workflows/ci.yml`: 1,000 buyers vs 10 units, strategy B) gates on this exit code.
 
 ### Trade-offs and limits
 - The client, API, and Postgres share one laptop. The load generator's 10,000 goroutines compete for the same CPU as the API. Numbers are for comparison, not capacity.

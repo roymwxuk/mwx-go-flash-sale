@@ -1,10 +1,12 @@
 # mwx-go-flash-sale
 
+[![CI](https://github.com/roymwxuk/mwx-go-flash-sale/actions/workflows/ci.yml/badge.svg)](https://github.com/roymwxuk/mwx-go-flash-sale/actions/workflows/ci.yml)
+
 A flash-sale API for limited drops (event tickets, limited fan goods) in Go and PostgreSQL. It is built to **prove, with measured numbers, that it never oversells**: 10,000 buyers hit 100 units at the same instant, and no stock is oversold, no buyer is charged twice, and expired holds are released exactly once.
 
 **Why it's hard:** every buyer decrements the same database row. A plain "read stock, then write stock" lets thousands of buyers see the same last unit (measured below: it oversold 100 units by up to 1,683). Retries and double-clicks can charge a card twice, and a background job that releases unpaid holds can return the same unit twice if two copies of it run. This project builds the API, then proves each guarantee with database constraints, concurrency tests, and a load generator that checks the database after every run.
 
-> **Status:** three stock strategies (A naive, B atomic, C pessimistic), idempotency keys, confirm with a mock payment provider (failure injection), an expiry sweeper safe with N instances, an invariant checker, barrier-start concurrency tests, and an HTTP load generator (burst, messy-client, and capacity-ceiling scenarios). **Not done yet:** CI, and the pool-size comparison (see [Known limitations](#known-limitations)).
+> **Status:** three stock strategies (A naive, B atomic, C pessimistic), idempotency keys, confirm with a mock payment provider (failure injection), an expiry sweeper safe with N instances, an invariant checker, barrier-start concurrency tests, an HTTP load generator (burst, messy-client, and capacity-ceiling scenarios), and CI (`go vet`, `staticcheck`, `go test -race`, and a load smoke test that fails the build on any invariant violation). **Not done yet:** the pool-size comparison (see [Known limitations](#known-limitations)).
 
 ## Headline results: 10,000 buyers vs 100 units over HTTP
 
@@ -167,7 +169,7 @@ The race detector finds data races in memory inside one Go process. Oversell is 
 ## Known limitations
 
 - **One laptop.** The load generator, API and Postgres share one machine (Postgres in a 2-CPU Docker VM), so the numbers compare strategies; they aren't capacity figures. Throughput varied up to about 2× between runs of the same code.
-- **CI is not built yet** (GitHub Actions with `go vet`, `go test -race` and a load smoke test). `make test` and `make load` exit non-zero on failure, so a CI job only needs to call them.
+- **CI runs a small load test only** (1,000 buyers vs 10 units, strategy B, on a shared GitHub runner). It gates correctness: any invariant violation or H1 failure fails the build. The 10,000-buyer numbers above come from local runs, not CI.
 - **Pool size was not compared.** Every run used 20 connections. The hypothesis that burst latency is mostly pool wait, not lock wait, is untested ([ADR-009]({D}adr-009-connection-pool-sizing-and-behavior-under-pool-exhaustion)).
 - **Strategy D (optimistic version column) and a SERIALIZABLE run were cut.** The reasoning against them in ADR-003 and ADR-007 is argument, not measurement.
 - **Payments that stay pending forever** (provider outage, and the client never retries) keep their stock held. Production needs a reconciliation job that asks the provider for the outcome.

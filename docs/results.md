@@ -19,7 +19,7 @@ All runs were on one machine: Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.2, Go 
 | Sweepers: 3 sweepers, 200 expired holds | exactly 200 released, 10/10 runs | Expiry sweeper 16:30 |
 | Confirm racing the sweeper, 150 confirms | 0 charged-but-expired, 10/10 runs | Expiry sweeper 16:30 |
 
-**Not measured (cut for time):** pool-size comparison (ADR-009), strategy D (ADR-007), SERIALIZABLE (ADR-003). CI has not been built yet.
+**Not measured (cut for time):** pool-size comparison (ADR-009), strategy D (ADR-007), SERIALIZABLE (ADR-003). CI (`.github/workflows/ci.yml`) runs a 1,000-buyer smoke test for correctness only; its numbers aren't recorded here, because shared runners are too noisy to compare.
 
 ---
 

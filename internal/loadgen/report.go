@@ -187,14 +187,25 @@ func writeBurst(b *strings.Builder, runs []Result) {
 	for _, r := range runs {
 		runNo[r.Strategy]++
 		fmt.Fprintf(b, "\n**%s, run %d** (pool=%d, drop %d)\n", r.Strategy, runNo[r.Strategy], r.PoolSize, r.DropID)
-		fmt.Fprintf(b, "- Buyers: %d · Stock: %d · Requests: %d (dup %d, retries %d) · Duration: %.2f s\n",
-			r.Buyers, r.Stock, r.Requests, r.Duplicates, r.Retries, r.ElapsedMs/1000)
+		fmt.Fprintf(b, "- Buyers: %d · Stock: %d · Requests: %d (first attempts %d, dup %d, retries %d, confirms %d) · Duration: %.2f s\n",
+			r.Buyers, r.Stock, r.Requests+r.Extra.Requests+r.Confirm.Requests, r.Requests, r.Duplicates, r.Retries,
+			r.Confirm.Requests, r.ElapsedMs/1000)
 		fmt.Fprintf(b, "- Latency ms: p50 %.1f · p95 %.1f · p99 %.1f · max %.1f · 201 only: p50 %.1f / p95 %.1f / p99 %.1f · 409 only: p50 %.1f / p95 %.1f / p99 %.1f · Peak in-flight: %d\n",
 			r.Latency.P50, r.Latency.P95, r.Latency.P99, r.Latency.Max,
 			r.LatencyCreated.P50, r.LatencyCreated.P95, r.LatencyCreated.P99,
 			r.LatencySoldOut.P50, r.LatencySoldOut.P95, r.LatencySoldOut.P99, r.PeakInFlight)
-		fmt.Fprintf(b, "- Outcome: sold %d · released n/a · resold n/a · 409 %d · 503 %d · other 5xx %d · transport errors %d · hung %d\n",
+		fmt.Fprintf(b, "- Outcome (first attempts): held %d · 409 %d · 503 %d · other 5xx %d · transport errors %d · hung %d\n",
 			r.Created, r.SoldOut, r.Unavailable, r.Server5xx, r.TransportErrors, r.Hung)
+		if r.Extra.Requests > 0 {
+			fmt.Fprintf(b, "- Duplicate/retry reservation requests: %d · 201 %d · 409 %d · 503 %d · other errors %d\n",
+				r.Extra.Requests, r.Extra.Created, r.Extra.SoldOut, r.Extra.Unavailable, r.Extra.Errors()-r.Extra.Unavailable)
+		}
+		if r.Confirm.Requests > 0 {
+			fmt.Fprintf(b, "- Confirm: %d requests · confirmed 200 %d · declined 402 %d (hold released) · 503 %d · other %d · latency ms p50 %.1f / p95 %.1f / p99 %.1f\n",
+				r.Confirm.Requests, r.Confirm.Confirmed, r.Confirm.Declined, r.Confirm.Unavailable,
+				r.Confirm.Server5xx+r.Confirm.OtherStatus+r.Confirm.TransportErrors+r.Confirm.Hung,
+				r.Confirm.Latency.P50, r.Confirm.Latency.P95, r.Confirm.Latency.P99)
+		}
 		i1 := invStatus(r.Invariants, invariants.NoOversell)
 		if r.SampledOversell > 0 {
 			i1 = fmt.Sprintf("FAIL (oversold by %d mid-run)", r.SampledOversell)
@@ -202,7 +213,7 @@ func writeBurst(b *strings.Builder, runs []Result) {
 		fmt.Fprintf(b, "- Invariants: I1 %s, %d mid-run samples, peak active %d · I2 %s · I3 %s · I4 n/a (no expiry until M5) · I5 %s · H1 %s\n",
 			i1, r.Samples, r.PeakActive,
 			invStatus(r.Invariants, invariants.PerUserLimit),
-			invStatus(r.Invariants, invariants.NoDoubleCharge, invariants.PaymentConsistency),
+			i3Status(r),
 			invStatus(r.Invariants, invariants.StockConservation),
 			okFail(r.H1()))
 		writeViolations(b, r.Invariants)
@@ -239,6 +250,16 @@ func writeCeiling(b *strings.Builder, c CeilingResult) {
 		}
 	}
 	b.WriteString("\n")
+}
+
+// i3Status combines the DB checks with what only the client can see: one
+// Idempotency-Key that produced two different successful responses.
+func i3Status(r Result) string {
+	st := invStatus(r.Invariants, invariants.NoDoubleCharge, invariants.PaymentConsistency)
+	if r.KeyViolations > 0 {
+		return fmt.Sprintf("FAIL (%d keys with two different effects; DB: %s)", r.KeyViolations, st)
+	}
+	return st
 }
 
 func writeViolations(b *strings.Builder, rep *invariants.Report) {

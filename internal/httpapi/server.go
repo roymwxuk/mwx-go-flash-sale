@@ -37,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /drops", s.createDrop)
 	mux.HandleFunc("GET /drops/{id}", s.getDrop)
 	mux.HandleFunc("POST /drops/{id}/reservations", s.reserve)
+	mux.HandleFunc("POST /reservations/{id}/confirm", s.confirm)
 	return s.withTimeout(mux)
 }
 
@@ -95,21 +96,13 @@ type reserveRequest struct {
 }
 
 // POST /drops/{id}/reservations
-//
-// Idempotency-Key is required by the API contract now so clients send it from
-// day one. Storing and replaying it lands in milestone 4.
 func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
-	userID := r.Header.Get("X-User-Id")
-	if userID == "" {
-		writeError(w, http.StatusBadRequest, "missing_user", "X-User-Id header is required")
-		return
-	}
-	if r.Header.Get("Idempotency-Key") == "" {
-		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
+	userID, key, ok := callerHeaders(w, r)
+	if !ok {
 		return
 	}
 	req := reserveRequest{Quantity: 1} // an empty body means quantity 1
@@ -117,13 +110,55 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-
-	res, err := s.sale.Reserve(r.Context(), id, userID, req.Quantity)
+	res, err := s.sale.Reserve(r.Context(), id, userID, req.Quantity, key)
 	if err != nil {
 		s.writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, res)
+	writeResult(w, res)
+}
+
+// POST /reservations/{id}/confirm
+func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	userID, key, ok := callerHeaders(w, r)
+	if !ok {
+		return
+	}
+	res, err := s.sale.Confirm(r.Context(), id, userID, key)
+	if err != nil {
+		s.writeDomainError(w, err)
+		return
+	}
+	writeResult(w, res)
+}
+
+func callerHeaders(w http.ResponseWriter, r *http.Request) (userID, key string, ok bool) {
+	userID = r.Header.Get("X-User-Id")
+	key = r.Header.Get("Idempotency-Key")
+	switch {
+	case userID == "":
+		writeError(w, http.StatusBadRequest, "missing_user", "X-User-Id header is required")
+		return "", "", false
+	case key == "":
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
+		return "", "", false
+	}
+	return userID, key, true
+}
+
+// writeResult sends a stored-or-fresh response byte for byte. Replays are
+// marked so clients and tests can tell them apart without parsing the body.
+func writeResult(w http.ResponseWriter, res sale.Result) {
+	w.Header().Set("Content-Type", "application/json")
+	if res.Replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	w.WriteHeader(res.Status)
+	_, _ = w.Write(res.Body)
 }
 
 // writeDomainError maps service errors to HTTP. Anything that ran out of time
@@ -141,6 +176,14 @@ func (s *Server) writeDomainError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "per_user_limit", err.Error())
 	case errors.Is(err, sale.ErrSaleNotStarted):
 		writeError(w, http.StatusConflict, "sale_not_started", err.Error())
+	case errors.Is(err, sale.ErrIdempotencyMismatch):
+		writeError(w, http.StatusUnprocessableEntity, "idempotency_key_reused", err.Error())
+	case errors.Is(err, sale.ErrNotHeld):
+		writeError(w, http.StatusConflict, "reservation_not_held", err.Error())
+	case errors.Is(err, sale.ErrHoldExpired):
+		writeError(w, http.StatusGone, "hold_expired", err.Error())
+	case errors.Is(err, sale.ErrPaymentPending):
+		writeError(w, http.StatusServiceUnavailable, "payment_pending", err.Error())
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled), pgconn.Timeout(err):
 		writeError(w, http.StatusServiceUnavailable, "timeout", "server busy, retry with the same Idempotency-Key")
 	default:

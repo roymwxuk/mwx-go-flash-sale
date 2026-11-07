@@ -159,3 +159,79 @@ The load test must show what happens when 10,000 buyers arrive *at the same inst
 10. **Capacity ceiling (L5) is open-loop.** Requests are scheduled in 10 ms slots at the target rate whether or not earlier ones have finished, and latency is measured from the *scheduled* time. A closed-loop client (send the next request only after the previous returns) slows down exactly when the server does and hides the queue. This is "coordinated omission": it makes overloaded steps look fast.
 11. **L5 uses a shared keep-alive pool capped at 2,000 connections**, unlike the burst. A constant rate is what a reusable pool is for, and the cap stops an overloaded step from exhausting ports. The cost is that, past the ceiling, the backlog queues in the client rather than reaching the server as 503s. It is still counted as latency (point 10), and the step fails either way.
 12. **Every result records `git rev-parse --short HEAD`**, suffixed `-dirty` when tracked files have uncommitted changes, so each number traces back to the code that produced it.
+
+---
+
+## ADR-005: Idempotency keys
+
+**Status:** accepted (milestone 4)
+
+### Context
+Clients time out and retry, and users double-click. Every reservation and confirm request carries an `Idempotency-Key`. The guarantee: **the same key and the same request produce at most one effect and the same response; the same key with a different request gets 422.** Two identical requests can arrive in the same millisecond, on different connections.
+
+### Options considered
+1. **Check, then insert** (SELECT the key; if missing, do the work and store it). Two concurrent requests both see "missing" and both do the work. Rejected: this is the naive strategy's race again.
+2. **Insert the key first in its own transaction, then do the work, then store the response** (insert-first with a status column). Duplicates see an "in progress" row and must poll or wait. A crash between the key insert and the work leaves a stuck key that needs a lease and takeover logic.
+3. **Insert the key inside the same transaction as the effect** (chosen for reserve). Concurrent duplicates block on the key's primary key until the first transaction ends. On COMMIT, the duplicate's `INSERT ... ON CONFLICT DO NOTHING` affects 0 rows, and it replays the stored response. On ROLLBACK, the duplicate's insert succeeds and it does the work itself.
+
+### Decision
+- **Storage:** `idempotency_keys`, PK `(user_id, key)`, so keys are scoped per user and two users can't collide. It also stores `endpoint`, `request_hash`, `response_status`, and `response_body` (the exact bytes sent).
+- **Request identity:** `request_hash` = SHA-256 of the endpoint template plus the request's *meaning* (drop id and quantity; reservation id). `{}` and `{"quantity":1}` therefore count as the same request, while another drop, another quantity, or another endpoint is a different one and gets **422 `idempotency_key_reused`**.
+- **Reserve:** the replay lookup is folded into the existing pre-check query (`drops LEFT JOIN idempotency_keys`), so the sold-out path still costs **one** query. Inside the transaction, the order is: claim key → insert reservation → store response → take stock (hot row last, as in ADR-003). Concurrent duplicates are serialized by the database, with no polling and no lease.
+- **Only successful effects are stored.** Validation errors, not found, sale not started, sold out, and per-user limit are *not* stored. They had no side effect, so re-running them is harmless, and storing them would add a write to the sold-out path, which carries 99% of flash-sale traffic. Consequence (tested by `TestRejectionsAreNotStored`): a sold-out answer under key K doesn't stick to K, so if a declined payment returns a unit, retrying K can succeed. For a buyer, that's the desirable behavior.
+- **Replays** are byte-identical and carry `Idempotent-Replayed: true`.
+- **Confirm** uses the same table, but can't keep a transaction open across the payment call (ADR-006). It stores the final response after the payment settles. Its correctness doesn't depend on the key at all (confirm is idempotent by state), so a duplicate that slips past the key check just re-drives the same state machine to the same answer.
+- **TTL:** keys are meant to live for 24 h. Deleting old keys is a job for the background worker in milestone 5. Until then, keys don't expire.
+
+### Evidence
+- `TestIdempotentReserveConcurrentSameKey` (C3): 50 identical requests at the same instant give 1 reservation, 50 byte-identical responses, and 49 replays, under both strategies. A mutation test (removing the key claim) makes it fail.
+- `TestIdempotencyKeyReuseWithDifferentRequest` (C4): different quantity, drop, or endpoint gives 422 with no effect.
+- Load (`make load-messy`, 10,000 buyers): about 14,160 requests per run, including 983 double-clicks and about 3,077 same-key retries, with **0 keys that produced two different successful responses**.
+
+### Trade-offs
+- A duplicate waiting on the key holds a pool connection for as long as the first transaction runs (a few ms). A storm of same-key duplicates could therefore use up pool connections. Accepted: per-key duplicates are few, and the alternative (polling) costs more queries overall.
+- The success path makes about 7 round trips instead of 5. The extra ones (claim, store) happen before the stock row is locked, so the hot-row lock time doesn't change. Measured: the write ceiling stayed at 500 req/s.
+
+---
+
+## ADR-006: Confirm and mock payment
+
+**Status:** accepted (milestone 4)
+
+### Context
+Confirming means charging money through an external provider: 100–300 ms, may decline, may time out with an unknown outcome. The invariants: **never charge twice** (I3), **a confirmed reservation always has exactly one successful payment and vice versa**, and **a declined payment returns the stock exactly once** (I5).
+
+### Options considered
+1. **One transaction around the payment call.** That holds a pool connection and the reservation's row lock for the whole payment latency, and a timeout mid-call rolls back the DB record of a charge that may have happened. Rejected.
+2. **Separate steps, with the provider's idempotency key derived from the reservation** (chosen).
+
+### Decision: a re-runnable state machine
+1. **tx1:** `SELECT ... FOR UPDATE` on the reservation (owner, status, expiry), then INSERT `payments(status='pending')`. `payments.reservation_id UNIQUE` allows one payment row per reservation, ever.
+2. **Charge** the provider with key `res-<reservation id>`, outside any transaction. Every confirm attempt for a reservation (retries, double-clicks, *different* client keys) sends the same provider key, so the provider charges at most once.
+3. **tx2:** conditional transitions only. Approved: `pending→succeeded` and `held→confirmed`. Declined: `pending→failed` and `held→cancelled`, plus `remaining += quantity` only when that `UPDATE ... WHERE status='held'` actually matched a row. Running tx2 twice changes nothing the second time, so stock is released **exactly once**.
+4. **Store** the response under the client's Idempotency-Key (200 with the confirmed reservation, or 402 `payment_failed`).
+
+Calling Confirm again, concurrently or later, just drives the same reservation to the same final state.
+
+### Failure handling
+| Situation | Behavior |
+|---|---|
+| Provider declines | 402, hold cancelled, stock returned once. A retry with the same key replays the 402. |
+| Provider call times out or the client disconnects | Payment stays `pending`. The API answers **503 `payment_pending`**: retry with the same key. The retry asks the provider again with the same provider key and gets the recorded outcome, with no second charge. |
+| Client disconnects *after* the provider answered | tx2 runs with `context.WithoutCancel` plus a 5 s timeout, so the DB records what the provider did even though nobody is listening. |
+| Hold expired before confirm | 410 `hold_expired`, nothing charged (C8). |
+| Hold expires *while* a payment is pending | Confirm resumes it (the money may have moved). The milestone 5 sweeper must skip reservations with a pending payment. |
+| Another user's reservation | 404, so other users' reservation IDs aren't revealed. |
+
+### The mock provider
+`internal/payment.Mock`: configurable latency range and failure rate (`PAYMENT_MIN_LATENCY`, `PAYMENT_MAX_LATENCY`, `PAYMENT_FAILURE_RATE`), idempotent per key, thread-safe. It records the outcome **before** the simulated latency, so a caller that times out has really been charged. That's the ambiguous case every real integration has to handle, and the tests exercise it. It's in-memory per API process; with several instances, a real provider would be the shared source of truth.
+
+### Bug found during this milestone: a stale joined row under READ COMMITTED
+The first version of tx1 read the reservation **and** its payment in one statement with `FOR UPDATE OF r`. `TestConcurrentDeclinedConfirmReleasesOnce` (20 concurrent confirms of a declined payment) failed 3 times in 5 runs: some callers got 409 "not held" instead of 402. **Cause:** when a READ COMMITTED statement waits for a row lock, Postgres re-reads *only the locked row* at its newest version after the wait; rows joined from other tables still come from the snapshot taken *before* the wait. A waiter could therefore see a fresh `cancelled` reservation next to a stale `pending` payment, a combination that never existed. **Fix:** take the lock first, then read the payment in a separate statement, which gets a fresh snapshot. The test then passed 15/15 under `-race`. Stock was never released twice, even before the fix, because tx2's conditional UPDATEs guarded it. Only the response code was wrong.
+
+### Evidence
+- `TestConcurrentConfirmChargesOnce` (C6): 20 confirms with the same key plus 20 with different keys, all concurrent with a slow provider, give 1 payment row and 1 charge.
+- `TestConfirmRetryAfterTimeoutDoesNotDoubleCharge` (C6): the client gives up mid-payment, gets 503, retries, and gets 200 with 1 charge over 2 provider calls.
+- `TestPaymentFailureReleasesHold` (C5), `TestConcurrentDeclinedConfirmReleasesOnce`, `TestConfirmAfterExpiryIsRejected` (C8).
+- A mutation test (removing the `status='held'` guard on release) makes the release-once test fail.
+- Load: all winners confirm with 5% declined, and the provider's total charges equal the confirmed reservations (`TestRunMessyClients`). Every invariant held at 10,000 buyers.

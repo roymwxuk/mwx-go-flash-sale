@@ -12,6 +12,7 @@ import (
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/httpapi"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/invariants"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/loadgen"
+	"github.com/roymwxuk/mwx-go-flash-sale/internal/payment"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/sale"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/testdb"
 )
@@ -59,7 +60,7 @@ func TestMarkdownIncludesRunsAndViolations(t *testing.T) {
 func TestRunAgainstRealServer(t *testing.T) {
 	pool := testdb.New(t, 20)
 	strat, _ := sale.ParseStrategy("atomic")
-	svc := sale.NewService(pool, strat, time.Minute)
+	svc := sale.NewService(pool, strat, time.Minute, nil)
 	srv := httptest.NewServer(httpapi.New(pool, svc, slog.New(slog.NewTextHandler(io.Discard, nil)), 10*time.Second).Handler())
 	defer srv.Close()
 
@@ -100,7 +101,7 @@ func TestRunAgainstRealServer(t *testing.T) {
 func TestRunCeilingAgainstRealServer(t *testing.T) {
 	pool := testdb.New(t, 10)
 	strat, _ := sale.ParseStrategy("atomic")
-	svc := sale.NewService(pool, strat, time.Minute)
+	svc := sale.NewService(pool, strat, time.Minute, nil)
 	srv := httptest.NewServer(httpapi.New(pool, svc, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Second).Handler())
 	defer srv.Close()
 
@@ -127,5 +128,44 @@ func TestRunCeilingAgainstRealServer(t *testing.T) {
 	}
 	if rep.Stats.Held != 150 {
 		t.Fatalf("held = %d, want 150", rep.Stats.Held)
+	}
+}
+
+// Messy clients end to end: double clicks, same-key retries, winners paying
+// with 30% declined. No key may produce two different effects, H1 holds for
+// every request, and the DB passes every invariant.
+func TestRunMessyClients(t *testing.T) {
+	pool := testdb.New(t, 20)
+	strat, _ := sale.ParseStrategy("atomic")
+	gw := payment.NewMock(payment.MockConfig{FailureRate: 0.3, Seed: 7, MaxLatency: 20 * time.Millisecond})
+	svc := sale.NewService(pool, strat, time.Minute, gw)
+	srv := httptest.NewServer(httpapi.New(pool, svc, slog.New(slog.NewTextHandler(io.Discard, nil)), 10*time.Second).Handler())
+	defer srv.Close()
+
+	const buyers, stock = 300, 20
+	res, err := loadgen.Run(context.Background(), loadgen.Config{
+		BaseURL: srv.URL, Buyers: buyers, Stock: stock, RunID: "m",
+		ClientTimeout: 30 * time.Second, DialConcurrency: 32,
+		DupRatio: 0.2, RetryRatio: 0.3, Confirm: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Duplicates == 0 || res.Retries == 0 || res.Confirm.Requests < stock {
+		t.Fatalf("messy traffic not generated: dup=%d retries=%d confirms=%d", res.Duplicates, res.Retries, res.Confirm.Requests)
+	}
+	if res.KeyViolations != 0 || !res.H1() || res.Created != stock {
+		t.Fatalf("key_violations=%d H1=%v created=%d: %+v", res.KeyViolations, res.H1(), res.Created, res)
+	}
+	if res.Confirm.Declined == 0 || res.Confirm.Confirmed == 0 {
+		t.Fatalf("want both confirmed and declined payments: %+v", res.Confirm)
+	}
+	rep, err := invariants.Check(context.Background(), pool, res.DropID)
+	if err != nil || !rep.OK() {
+		t.Fatalf("invariants: %+v, %v", rep, err)
+	}
+	// Each winner paid at most once, whatever the retries.
+	if gw.TotalCharged() != rep.Stats.Confirmed {
+		t.Fatalf("provider charged %d times for %d confirmed reservations", gw.TotalCharged(), rep.Stats.Confirmed)
 	}
 }

@@ -29,13 +29,14 @@ type outcome struct {
 }
 
 // race releases n goroutines at the same instant against one drop.
-// userOf(i) decides which user goroutine i buys as.
+// userOf(i) decides which user goroutine i buys as, keyOf(i) which
+// Idempotency-Key it sends.
 //
 // The start barrier: every goroutine first signals `ready`, then blocks on
 // `<-start`. Only when all n are parked do we close(start). A receive on a
 // closed channel returns immediately for *every* waiter, so all n are
 // released together instead of trickling in as they are spawned.
-func race(t *testing.T, svc *sale.Service, dropID int64, n int, userOf func(i int) string) *outcome {
+func race(t *testing.T, svc *sale.Service, dropID int64, n int, userOf, keyOf func(i int) string) *outcome {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -51,7 +52,7 @@ func race(t *testing.T, svc *sale.Service, dropID int64, n int, userOf func(i in
 			defer done.Done()
 			ready.Done()
 			<-start
-			_, err := svc.Reserve(ctx, dropID, userOf(i), 1)
+			_, err := svc.Reserve(ctx, dropID, userOf(i), 1, keyOf(i))
 			switch {
 			case err == nil:
 				res.ok.Add(1)
@@ -81,7 +82,7 @@ func newDrop(t *testing.T, pool *pgxpool.Pool, strategy string, total int) (*sal
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := sale.NewService(pool, strat, 5*time.Minute)
+	svc := sale.NewService(pool, strat, 5*time.Minute, nil)
 	d, err := svc.CreateDrop(context.Background(), sale.CreateDropInput{Name: t.Name(), TotalStock: total})
 	if err != nil {
 		t.Fatal(err)
@@ -99,6 +100,7 @@ func check(t *testing.T, pool *pgxpool.Pool, dropID int64) invariants.Report {
 }
 
 func distinctUsers(i int) string { return fmt.Sprintf("user-%d", i) }
+func distinctKeys(i int) string  { return fmt.Sprintf("key-%d", i) }
 
 // Strategy B must never oversell: exactly `stock` winners, everyone else
 // gets a clean sold-out, and the DB passes every invariant.
@@ -106,7 +108,7 @@ func TestConcurrentAtomicNeverOversells(t *testing.T) {
 	pool := testdb.New(t, poolSize)
 	svc, dropID := newDrop(t, pool, "atomic", stock)
 
-	res := race(t, svc, dropID, buyers, distinctUsers)
+	res := race(t, svc, dropID, buyers, distinctUsers, distinctKeys)
 
 	if got := res.ok.Load(); got != stock {
 		t.Errorf("successful holds = %d, want exactly %d", got, stock)
@@ -132,7 +134,7 @@ func TestConcurrentNaiveOversells(t *testing.T) {
 
 	for round := 1; round <= rounds; round++ {
 		svc, dropID := newDrop(t, pool, "naive", stock)
-		res := race(t, svc, dropID, buyers, distinctUsers)
+		res := race(t, svc, dropID, buyers, distinctUsers, distinctKeys)
 		rep := check(t, pool, dropID)
 		t.Logf("naive round %d: ok=%d sold_out=%d oversold=%d stats=%+v",
 			round, res.ok.Load(), res.soldOut.Load(), rep.Stats.Oversold(), rep.Stats)
@@ -157,7 +159,7 @@ func TestConcurrentSameUserGetsOneHold(t *testing.T) {
 			pool := testdb.New(t, poolSize)
 			svc, dropID := newDrop(t, pool, strategy, stock)
 
-			res := race(t, svc, dropID, 50, func(int) string { return "same-user" })
+			res := race(t, svc, dropID, 50, func(int) string { return "same-user" }, distinctKeys)
 
 			if res.ok.Load() != 1 || res.perUser.Load() != 49 {
 				t.Errorf("ok=%d per_user=%d, want 1 and 49", res.ok.Load(), res.perUser.Load())
@@ -178,12 +180,12 @@ func TestConcurrentSoldOutIsConsistent(t *testing.T) {
 			pool := testdb.New(t, poolSize)
 			svc, dropID := newDrop(t, pool, strategy, 3)
 			for i := 0; i < 3; i++ {
-				if _, err := svc.Reserve(context.Background(), dropID, fmt.Sprintf("early-%d", i), 1); err != nil {
+				if _, err := svc.Reserve(context.Background(), dropID, fmt.Sprintf("early-%d", i), 1, "early"); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			res := race(t, svc, dropID, 100, distinctUsers)
+			res := race(t, svc, dropID, 100, distinctUsers, distinctKeys)
 
 			if res.soldOut.Load() != 100 || res.ok.Load() != 0 {
 				t.Errorf("ok=%d sold_out=%d, want 0 and 100", res.ok.Load(), res.soldOut.Load())

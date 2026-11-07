@@ -128,14 +128,18 @@ Invariants: I1 <ok/n> · I2 <> · I3 <> · I4 <> · I5 <> · H1 <>
 |---|---|---|
 | C1 | ✅ done (A and B; C after milestone 5) | `internal/sale/concurrency_test.go`: `TestConcurrentAtomicNeverOversells`, `TestConcurrentNaiveOversells` |
 | C2 | ✅ done (50 concurrent attempts, more than the 20 planned) | `TestConcurrentSameUserGetsOneHold` |
-| C3, C4 | ⏳ milestone 4 (idempotency keys) | |
-| C5, C6 | ⏳ milestone 4 (confirm + mock payment) | |
-| C7, C8 | ⏳ milestone 5 (expiry sweeper) | |
+| C3 | ✅ done (both strategies) | `internal/sale/idempotency_test.go`: `TestIdempotentReserveConcurrentSameKey` |
+| C4 | ✅ done (quantity, drop, and endpoint mismatches) | `TestIdempotencyKeyReuseWithDifferentRequest` |
+| C5 | ✅ done | `TestPaymentFailureReleasesHold`, `TestConcurrentDeclinedConfirmReleasesOnce` |
+| C6 | ✅ done (20 same-key + 20 different-key confirms; retry after a timeout mid-payment) | `TestConcurrentConfirmChargesOnce`, `TestConfirmRetryAfterTimeoutDoesNotDoubleCharge` |
+| C7 | ⏳ milestone 5 (expiry sweeper) | |
+| C8 | ✅ done (hold past `expires_at` → 410, nothing charged; also needs the sweeper case in milestone 5) | `TestConfirmAfterExpiryIsRejected` |
 | C9 | ✅ done | `TestConcurrentSoldOutIsConsistent` |
 | C10 | optional, after milestone 5 | |
 | L1 | ✅ done, including H1, mid-run I1 sampling, per-outcome latency, peak in-flight, git commit | `make load` → `docs/results.md` |
 | L2 | ⏳ after milestones 4 and 5. Needs same-key retries, confirm/payment, and hold expiry with resale; without them the "released and resold" numbers would be invented | |
-| L3, L4, L6 | ⏳ after L2 (they are L2 variants) | |
+| L3, L4 | ⏳ after L2 (they are L2 variants) | |
+| L6 | 🟡 partial: `make load-messy` = L1 burst + 10% double-clicks + 30% same-key retries + confirm with 5% declines. Not yet on top of L2, and timeouts are not injected (retries follow a received answer) | `docs/results.md` 16:01 |
 | L5 | ✅ done | `make load-ceiling` → `docs/results.md` |
 | L7 | ⏳ milestone 5 (pool-size comparison); `-pool` already exists | |
 | L8 | optional | |

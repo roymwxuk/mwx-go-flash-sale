@@ -63,26 +63,27 @@ func TestReserveSequential(t *testing.T) {
 			pool := testdb.New(t, 4)
 			svc, dropID := newDrop(t, pool, strategy, 2)
 
-			r, err := svc.Reserve(ctx, dropID, "a", 1)
-			if err != nil || r.Status != "held" || r.Quantity != 1 {
-				t.Fatalf("first hold: %+v, %v", r, err)
+			res, err := svc.Reserve(ctx, dropID, "a", 1, "k1")
+			r := res.Reservation
+			if err != nil || res.Status != 201 || r.Status != "held" || r.Quantity != 1 {
+				t.Fatalf("first hold: %+v, %v", res, err)
 			}
 			if !r.ExpiresAt.After(time.Now()) {
 				t.Errorf("expires_at %v should be in the future", r.ExpiresAt)
 			}
-			if _, err := svc.Reserve(ctx, dropID, "a", 1); !errors.Is(err, sale.ErrPerUserLimit) {
+			if _, err := svc.Reserve(ctx, dropID, "a", 1, "k2"); !errors.Is(err, sale.ErrPerUserLimit) {
 				t.Errorf("second hold same user: want ErrPerUserLimit, got %v", err)
 			}
-			if _, err := svc.Reserve(ctx, dropID, "b", 2); !errors.Is(err, sale.ErrPerUserLimit) {
+			if _, err := svc.Reserve(ctx, dropID, "b", 2, "k3"); !errors.Is(err, sale.ErrPerUserLimit) {
 				t.Errorf("quantity above limit: want ErrPerUserLimit, got %v", err)
 			}
-			if _, err := svc.Reserve(ctx, dropID, "b", 1); err != nil {
+			if _, err := svc.Reserve(ctx, dropID, "b", 1, "k4"); err != nil {
 				t.Errorf("last unit: %v", err)
 			}
-			if _, err := svc.Reserve(ctx, dropID, "c", 1); !errors.Is(err, sale.ErrSoldOut) {
+			if _, err := svc.Reserve(ctx, dropID, "c", 1, "k5"); !errors.Is(err, sale.ErrSoldOut) {
 				t.Errorf("after sell-out: want ErrSoldOut, got %v", err)
 			}
-			if _, err := svc.Reserve(ctx, 999999, "a", 1); !errors.Is(err, sale.ErrNotFound) {
+			if _, err := svc.Reserve(ctx, 999999, "a", 1, "k6"); !errors.Is(err, sale.ErrNotFound) {
 				t.Errorf("unknown drop: want ErrNotFound, got %v", err)
 			}
 
@@ -101,14 +102,14 @@ func TestReserveBeforeSaleStarts(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.New(t, 4)
 	strat, _ := sale.ParseStrategy("atomic")
-	svc := sale.NewService(pool, strat, time.Minute)
+	svc := sale.NewService(pool, strat, time.Minute, nil)
 
 	later := time.Now().Add(time.Hour)
 	d, err := svc.CreateDrop(ctx, sale.CreateDropInput{Name: "later", TotalStock: 1, SaleStartsAt: &later})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Reserve(ctx, d.ID, "a", 1); !errors.Is(err, sale.ErrSaleNotStarted) {
+	if _, err := svc.Reserve(ctx, d.ID, "a", 1, "k1"); !errors.Is(err, sale.ErrSaleNotStarted) {
 		t.Fatalf("want ErrSaleNotStarted, got %v", err)
 	}
 }

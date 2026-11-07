@@ -51,6 +51,14 @@ type options struct {
 	// burst (L1)
 	buyers, stock int
 	dialConc      int
+	dupRatio      float64
+	retryRatio    float64
+	confirm       bool
+
+	// mock payment provider inside the API
+	paymentFailureRate float64
+	paymentMinLatency  time.Duration
+	paymentMaxLatency  time.Duration
 
 	// ceiling (L5)
 	rates        []int
@@ -79,6 +87,12 @@ func main() {
 	flag.IntVar(&o.buyers, "buyers", 10000, "burst: number of simultaneous virtual buyers")
 	flag.IntVar(&o.stock, "stock", 100, "burst: units in the drop")
 	flag.IntVar(&o.dialConc, "dial-concurrency", 64, "burst: max simultaneous TCP connects during setup")
+	flag.Float64Var(&o.dupRatio, "dup-ratio", 0, "burst: share of buyers who double-click (same key, own connection, within 50 ms)")
+	flag.Float64Var(&o.retryRatio, "retry-ratio", 0, "burst: share of buyers who resend with the same key after their answer")
+	flag.BoolVar(&o.confirm, "confirm", false, "burst: winners confirm (pay) their hold")
+	flag.Float64Var(&o.paymentFailureRate, "payment-failure-rate", 0, "API mock payment: share of payments declined (holds released)")
+	flag.DurationVar(&o.paymentMinLatency, "payment-min-latency", 100*time.Millisecond, "API mock payment: min latency")
+	flag.DurationVar(&o.paymentMaxLatency, "payment-max-latency", 300*time.Millisecond, "API mock payment: max latency")
 
 	flag.StringVar(&rates, "rates", "500,1000,2000,4000,8000", "ceiling: target req/s per step")
 	flag.DurationVar(&o.stepDuration, "step", 20*time.Second, "ceiling: duration of each step")
@@ -162,13 +176,14 @@ func run(ctx context.Context, o options) (failed bool, err error) {
 				if err != nil {
 					return false, fmt.Errorf("%s run %d: %w", strategy, r, err)
 				}
-				if !res.H1() || (mustBeCorrect && (res.Violations() > 0 || res.SampledOversell > 0)) {
+				if !res.H1() || (mustBeCorrect && (res.Violations() > 0 || res.SampledOversell > 0 || res.KeyViolations > 0)) {
 					failed = true
 				}
-				log.Printf("%-7s run %d: 201=%d oversold=%d violations=%d 409=%d 503=%d errors=%d p50=%.1fms p95=%.1fms p99=%.1fms %.0f req/s peak_active=%d H1=%v",
-					strategy, r, res.Created, res.Oversold(), res.Violations(), res.SoldOut, res.Unavailable,
+				log.Printf("%-7s run %d: 201=%d oversold=%d violations=%d key_violations=%d 409=%d 503=%d errors=%d p50=%.1fms p95=%.1fms p99=%.1fms %.0f req/s peak_active=%d dup=%d retries=%d confirm(200=%d 402=%d 503=%d) H1=%v",
+					strategy, r, res.Created, res.Oversold(), res.Violations(), res.KeyViolations, res.SoldOut, res.Unavailable,
 					res.Errors()-res.Unavailable, res.Latency.P50, res.Latency.P95, res.Latency.P99,
-					res.ThroughputRPS, res.PeakActive, res.H1())
+					res.ThroughputRPS, res.PeakActive, res.Duplicates, res.Retries,
+					res.Confirm.Confirmed, res.Confirm.Declined, res.Confirm.Unavailable, res.H1())
 				rep.Runs = append(rep.Runs, res)
 			} else {
 				res, err := runCeiling(ctx, o, pool, strategy, runID)
@@ -212,6 +227,9 @@ func runBurst(ctx context.Context, o options, pool *pgxpool.Pool, strategy, runI
 			ClientTimeout:   o.clientTimeout,
 			DialConcurrency: o.dialConc,
 			Sampler:         activeSampler(pool),
+			DupRatio:        o.dupRatio,
+			RetryRatio:      o.retryRatio,
+			Confirm:         o.confirm,
 		})
 		return err
 	})
@@ -286,6 +304,9 @@ func withAPI(ctx context.Context, o options, strategy, runID string, fn func(bas
 		"STRATEGY="+strategy,
 		fmt.Sprintf("DB_MAX_CONNS=%d", o.pool),
 		"REQUEST_TIMEOUT="+o.serverTimeout.String(),
+		fmt.Sprintf("PAYMENT_FAILURE_RATE=%g", o.paymentFailureRate),
+		"PAYMENT_MIN_LATENCY="+o.paymentMinLatency.String(),
+		"PAYMENT_MAX_LATENCY="+o.paymentMaxLatency.String(),
 	)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {

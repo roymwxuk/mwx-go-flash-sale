@@ -168,3 +168,30 @@ func TestConcurrentSameUserGetsOneHold(t *testing.T) {
 		})
 	}
 }
+
+// Test plan C9: once stock is gone, a burst of 100 attempts all get a clean
+// sold-out under both strategies, and remaining never goes below zero (the
+// CHECK constraint would turn that into an error, which race() reports).
+func TestConcurrentSoldOutIsConsistent(t *testing.T) {
+	for _, strategy := range sale.StrategyNames() {
+		t.Run(strategy, func(t *testing.T) {
+			pool := testdb.New(t, poolSize)
+			svc, dropID := newDrop(t, pool, strategy, 3)
+			for i := 0; i < 3; i++ {
+				if _, err := svc.Reserve(context.Background(), dropID, fmt.Sprintf("early-%d", i), 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res := race(t, svc, dropID, 100, distinctUsers)
+
+			if res.soldOut.Load() != 100 || res.ok.Load() != 0 {
+				t.Errorf("ok=%d sold_out=%d, want 0 and 100", res.ok.Load(), res.soldOut.Load())
+			}
+			rep := check(t, pool, dropID)
+			if !rep.OK() || rep.Stats.Remaining != 0 || rep.Stats.Held != 3 {
+				t.Errorf("state %+v violations %+v", rep.Stats, rep.Violations)
+			}
+		})
+	}
+}

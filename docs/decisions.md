@@ -128,3 +128,34 @@ The strategy is chosen with `STRATEGY=naive|atomic`. `sale.Service.Reserve` owns
 - Inserting before decrementing means sold-out buyers who pass the stale pre-check do a wasted INSERT and rollback. That is cheap and only happens in the instant around sell-out.
 - Rolled-back INSERTs consume identity values, so reservation IDs have gaps. That is harmless.
 - `Idempotency-Key` is required by the API now but not stored until milestone 4.
+
+---
+
+## ADR-004: Load generator design
+
+**Status:** accepted (milestone 3)
+
+### Context
+The load test must show what happens when 10,000 buyers arrive *at the same instant*. If the client spreads the requests out (queueing, connection setup, slow dials), the burst softens, race windows shrink, and the measurements flatter the server.
+
+### Decisions
+1. **One pre-opened TCP connection per buyer.** Setup dials all N connections before the barrier, with at most 64 dials in flight so the listen backlog (`somaxconn` = 128 on macOS) never overflows. A dropped SYN would add a ~1 s retransmit that looks like server latency. Each buyer gets its own `http.Transport` that can only use its own connection.
+   - *Rejected:* one shared client with `MaxConnsPerHost = N`. A shared pool gives an idle connection to whichever request asks first, so a warm-up cannot guarantee N distinct sockets. Requests without one queue in the client or dial during the burst. That is client-side throttling, the opposite of what we want to measure.
+2. **Same start barrier as the tests** (`close(start)`). Requests and headers are built *before* the barrier, so only the send is timed.
+3. **A fresh API process per run.** loadgen starts `bin/api` with the run's `STRATEGY` and `DB_MAX_CONNS`, waits for `/healthz`, runs, then sends SIGINT. Strategies never share a warm process, and pool size is a real start-up setting.
+4. **The DB is the referee.** "Oversold" in the results comes from `invariants.Check` against Postgres, not from counting HTTP 201s.
+5. **`SO_LINGER=0` on client sockets.** Closing 10,000 sockets normally leaves them in TIME_WAIT (~30 s on macOS). The ephemeral range is only 16,384 ports, and the second run in our first attempt failed with `can't assign requested address`. Linger 0 closes with RST, which is fine for a load generator and wrong for a real client.
+6. **Timeouts:** server `REQUEST_TIMEOUT` = 5 s (pool wait included, then 503). Client timeout = 30 s, so a server 503 is recorded as a 503, not as a client timeout.
+7. **Exit code:** 1 if any strategy except `naive` violates an invariant. Naive is expected to fail. CI (milestone 6) relies on this.
+
+### Trade-offs and limits
+- The client, API, and Postgres share one laptop. The load generator's 10,000 goroutines compete for the same CPU as the API. Numbers are for comparison, not capacity.
+- On macOS, Postgres runs in a Docker VM (here 2 CPU / 1.9 GB) behind port forwarding. The machine spec in `results.md` records the VM size.
+- Percentiles are exact (all samples sorted). That is fine at 10,000 samples per run; a streaming histogram would be needed at millions.
+
+### Addendum (test plan L1/L5)
+8. **H1 is checked per run:** any 5xx other than 503, any transport error, or any request slower than client timeout + 1 s (or a client timeout) fails the run. All of these count, including for `naive`, because H1 is about overload behavior, not stock correctness.
+9. **I1 is sampled during the burst**, every 50 ms, through loadgen's own 4-connection pool (never the API's), plus once at the end. "At all times" is checked as "at every sample", which is as close as an external observer can get.
+10. **Capacity ceiling (L5) is open-loop.** Requests are scheduled in 10 ms slots at the target rate whether or not earlier ones have finished, and latency is measured from the *scheduled* time. A closed-loop client (send the next request only after the previous returns) slows down exactly when the server does and hides the queue. This is "coordinated omission": it makes overloaded steps look fast.
+11. **L5 uses a shared keep-alive pool capped at 2,000 connections**, unlike the burst. A constant rate is what a reusable pool is for, and the cap stops an overloaded step from exhausting ports. The cost is that, past the ceiling, the backlog queues in the client rather than reaching the server as 503s. It is still counted as latency (point 10), and the step fails either way.
+12. **Every result records `git rev-parse --short HEAD`**, suffixed `-dirty` when tracked files have uncommitted changes, so each number traces back to the code that produced it.

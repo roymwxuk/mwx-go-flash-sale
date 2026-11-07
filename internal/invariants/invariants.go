@@ -57,7 +57,9 @@ const maxListed = 5
 
 // Check inspects one drop. Exactly-once release (invariant 4) has no separate
 // query: releasing a hold twice returns its units twice, which shows up as a
-// conservation *surplus* (remaining + held + confirmed > total_stock).
+// conservation *surplus* (remaining + held + confirmed > total_stock). A lost
+// update also produces a surplus; no_oversell tells the two apart, since only
+// the lost update pushes held + confirmed above total_stock.
 func Check(ctx context.Context, db DB, dropID int64) (Report, error) {
 	var rep Report
 	st := &rep.Stats
@@ -87,9 +89,13 @@ func Check(ctx context.Context, db DB, dropID int64) (Report, error) {
 
 	// 5. Stock conservation (also catches double release, see above).
 	if sum := st.Remaining + st.Held + st.Confirmed; sum != st.TotalStock {
-		kind := "deficit: units promised without being taken from remaining (lost update?)"
+		// Surplus: more units accounted for than exist. Either holds were
+		// created without their decrement landing (lost update) or a release
+		// returned stock twice. Deficit: remaining was decremented with no
+		// matching reservation (e.g. a decrement committed without its row).
+		kind := "deficit: remaining decremented without a matching reservation"
 		if sum > st.TotalStock {
-			kind = "surplus: units returned to remaining more than once (double release?)"
+			kind = "surplus: holds without a matching decrement (lost update) or stock released twice"
 		}
 		add(StockConservation, "remaining %d + held %d + confirmed %d = %d != total_stock %d; %s",
 			st.Remaining, st.Held, st.Confirmed, sum, st.TotalStock, kind)

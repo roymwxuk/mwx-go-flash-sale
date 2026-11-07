@@ -5,7 +5,18 @@ PG_PORT      ?= 5432
 DATABASE_URL ?= postgres://flashsale:flashsale@localhost:$(PG_PORT)/flashsale?sslmode=disable
 export DATABASE_URL
 
-.PHONY: up down reset run build test test-short vet load
+# Load test knobs: make load BUYERS=1000 STOCK=10 POOL=50 STRATEGIES=atomic
+BUYERS     ?= 10000
+STOCK      ?= 100
+POOL       ?= 20
+STRATEGIES ?= naive,atomic
+REPEAT     ?= 1
+
+# Capacity ceiling knobs: make load-ceiling RATES=500,1000,2000 STEP=20s
+RATES ?= 500,1000,2000,4000,8000
+STEP  ?= 20s
+
+.PHONY: up down reset run build test test-short vet load load-ceiling
 
 up: ## Start Postgres and wait until it is healthy
 	$(COMPOSE) up -d --wait postgres
@@ -18,6 +29,7 @@ reset: ## Stop containers and delete the data volume
 
 build:
 	go build -o bin/api ./cmd/api
+	go build -o bin/loadgen ./cmd/loadgen
 
 run: ## Run the API locally (migrates on start)
 	go run ./cmd/api
@@ -31,5 +43,8 @@ test: ## Full test suite with the race detector (needs `make up`)
 test-short: ## Unit tests only, no database
 	go test -short -count=1 ./...
 
-load: ## Load generator (implemented in milestone 3)
-	@echo "cmd/loadgen is not implemented yet (milestone 3)." && exit 1
+load: build ## L1 burst: BUYERS released at once vs STOCK units, per strategy; appends to docs/results.md
+	./bin/loadgen -scenario burst -api-bin bin/api -strategies $(STRATEGIES) -buyers $(BUYERS) -stock $(STOCK) -pool $(POOL) -repeat $(REPEAT)
+
+load-ceiling: build ## L5: stepped constant rate (strategy B) until p99 > 500 ms or errors >= 1%
+	./bin/loadgen -scenario ceiling -api-bin bin/api -strategies atomic -rates $(RATES) -step $(STEP) -pool $(POOL)

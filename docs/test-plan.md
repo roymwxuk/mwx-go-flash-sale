@@ -126,7 +126,7 @@ Invariants: I1 <ok/n> · I2 <> · I3 <> · I4 <> · I5 <> · H1 <>
 
 | ID | Status | Where |
 |---|---|---|
-| C1 | ✅ done (A and B; C after milestone 5) | `internal/sale/concurrency_test.go`: `TestConcurrentAtomicNeverOversells`, `TestConcurrentNaiveOversells` |
+| C1 | ✅ done (A, B and C) | `internal/sale/concurrency_test.go`: `TestConcurrentCorrectStrategiesNeverOversell` (B, C), `TestConcurrentNaiveOversells` (A) |
 | C2 | ✅ done (50 concurrent attempts, more than the 20 planned) | `TestConcurrentSameUserGetsOneHold` |
 | C3 | ✅ done (both strategies) | `internal/sale/idempotency_test.go`: `TestIdempotentReserveConcurrentSameKey` |
 | C4 | ✅ done (quantity, drop, and endpoint mismatches) | `TestIdempotencyKeyReuseWithDifferentRequest` |

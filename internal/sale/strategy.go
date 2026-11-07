@@ -21,8 +21,9 @@ type StockStrategy interface {
 }
 
 var strategies = map[string]StockStrategy{
-	Naive{}.Name():  Naive{},
-	Atomic{}.Name(): Atomic{},
+	Naive{}.Name():       Naive{},
+	Atomic{}.Name():      Atomic{},
+	Pessimistic{}.Name(): Pessimistic{},
 }
 
 // ParseStrategy maps a config value such as "atomic" to its implementation.
@@ -94,6 +95,53 @@ func (Atomic) Take(ctx context.Context, tx pgx.Tx, dropID int64, n int) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrSoldOut
+	}
+	return nil
+}
+
+// Pessimistic is strategy C: lock the row, read, decide in Go, write.
+//
+// It is the naive strategy plus a row lock, and that one clause makes it
+// correct: the SELECT takes the row lock, so no other transaction can change
+// `remaining` between our read and our write. A transaction that has to wait
+// for the lock gets the *latest committed* value once the lock is granted
+// (READ COMMITTED re-reads the locked row after the wait). Only the locked
+// row is read here, with no join, so the stale-joined-row trap from ADR-006
+// cannot occur.
+//
+// Why FOR NO KEY UPDATE and not FOR UPDATE: the reserve transaction inserts
+// the reservation *before* taking stock (ADR-003), and that INSERT's foreign
+// key check takes FOR KEY SHARE on the drop row. FOR UPDATE conflicts with
+// other transactions' KEY SHARE, so two buyers each holding KEY SHARE and
+// each waiting for FOR UPDATE deadlock. The first version did exactly that
+// (999 of 1,000 requests failed with 40P01). FOR NO KEY UPDATE is the lock a
+// plain UPDATE of a non-key column takes; it blocks other writers but not
+// KEY SHARE. It is what Atomic's UPDATE gets implicitly, which is why Atomic
+// never hit this.
+//
+// The cost compared with Atomic: the lock is taken one round trip earlier.
+// It is held across SELECT → UPDATE → COMMIT (three round trips) instead of
+// UPDATE → COMMIT (two). On a single hot row, lock hold time is throughput.
+type Pessimistic struct{}
+
+func (Pessimistic) Name() string { return "pessimistic" }
+
+func (Pessimistic) Take(ctx context.Context, tx pgx.Tx, dropID int64, n int) error {
+	var remaining int
+	if err := tx.QueryRow(ctx,
+		`SELECT remaining FROM drops WHERE id = $1 FOR NO KEY UPDATE`, dropID,
+	).Scan(&remaining); err != nil {
+		return fmt.Errorf("pessimistic: lock row: %w", err)
+	}
+	if remaining < n {
+		return ErrSoldOut
+	}
+	// Relative update for defence in depth; under the lock an absolute
+	// value would be equally correct.
+	if _, err := tx.Exec(ctx,
+		`UPDATE drops SET remaining = remaining - $2 WHERE id = $1`, dropID, n,
+	); err != nil {
+		return fmt.Errorf("pessimistic: decrement: %w", err)
 	}
 	return nil
 }

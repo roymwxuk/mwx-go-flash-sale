@@ -130,3 +130,58 @@ func peakInFlight(samples []sample) int {
 	}
 	return peak
 }
+
+// ConfirmStats summarises POST /reservations/{id}/confirm calls. 200 is a
+// confirmed purchase and 402 a declined payment (hold released); both are
+// handled answers. 503 is allowed (payment outcome unknown, retry).
+type ConfirmStats struct {
+	Requests        int     `json:"requests"`
+	Confirmed       int     `json:"confirmed_200"`
+	Declined        int     `json:"declined_402"`
+	Unavailable     int     `json:"unavailable_503"`
+	Server5xx       int     `json:"server_5xx_other"`
+	OtherStatus     int     `json:"other_status"`
+	TransportErrors int     `json:"transport_errors"`
+	Hung            int     `json:"hung"`
+	Latency         Latency `json:"latency"`
+}
+
+func (c ConfirmStats) H1() bool {
+	return c.Server5xx == 0 && c.Hung == 0 && c.TransportErrors == 0
+}
+
+func summarizeConfirms(samples []sample, hungAfter time.Duration) ConfirmStats {
+	var c ConfirmStats
+	var lat []time.Duration
+	for _, x := range samples {
+		c.Requests++
+		if x.err != nil {
+			var ne net.Error
+			if errors.As(x.err, &ne) && ne.Timeout() {
+				c.Hung++
+			} else {
+				c.TransportErrors++
+			}
+			continue
+		}
+		d := x.end.Sub(x.start)
+		lat = append(lat, d)
+		if hungAfter > 0 && d > hungAfter {
+			c.Hung++
+		}
+		switch {
+		case x.status == http.StatusOK:
+			c.Confirmed++
+		case x.status == http.StatusPaymentRequired:
+			c.Declined++
+		case x.status == http.StatusServiceUnavailable:
+			c.Unavailable++
+		case x.status >= 500:
+			c.Server5xx++
+		default:
+			c.OtherStatus++
+		}
+	}
+	c.Latency = Summarize(lat)
+	return c
+}

@@ -12,11 +12,16 @@ POOL       ?= 20
 STRATEGIES ?= naive,atomic
 REPEAT     ?= 1
 
+# Messy clients (L6-style): make load-messy (10% double clicks, 30% same-key retries, winners pay, 5% declined)
+DUP_RATIO   ?= 0.1
+RETRY_RATIO ?= 0.3
+PAY_FAIL    ?= 0.05
+
 # Capacity ceiling knobs: make load-ceiling RATES=500,1000,2000 STEP=20s
 RATES ?= 500,1000,2000,4000,8000
 STEP  ?= 20s
 
-.PHONY: up down reset run build test test-short vet load load-ceiling
+.PHONY: up down reset run build test test-short vet load load-messy load-ceiling
 
 up: ## Start Postgres and wait until it is healthy
 	$(COMPOSE) up -d --wait postgres
@@ -45,6 +50,10 @@ test-short: ## Unit tests only, no database
 
 load: build ## L1 burst: BUYERS released at once vs STOCK units, per strategy; appends to docs/results.md
 	./bin/loadgen -scenario burst -api-bin bin/api -strategies $(STRATEGIES) -buyers $(BUYERS) -stock $(STOCK) -pool $(POOL) -repeat $(REPEAT)
+
+load-messy: build ## L1 + duplicates, same-key retries, confirm with payment failures (strategy B)
+	./bin/loadgen -scenario burst -api-bin bin/api -strategies atomic -buyers $(BUYERS) -stock $(STOCK) -pool $(POOL) -repeat $(REPEAT) \
+		-dup-ratio $(DUP_RATIO) -retry-ratio $(RETRY_RATIO) -confirm -payment-failure-rate $(PAY_FAIL)
 
 load-ceiling: build ## L5: stepped constant rate (strategy B) until p99 > 500 ms or errors >= 1%
 	./bin/loadgen -scenario ceiling -api-bin bin/api -strategies atomic -rates $(RATES) -step $(STEP) -pool $(POOL)

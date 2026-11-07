@@ -45,6 +45,12 @@ type Config struct {
 
 	Sampler     ActiveSampler // optional
 	SampleEvery time.Duration // default 50 ms
+
+	// Messy clients (test plan 2.4 / L6). Selection is deterministic per
+	// buyer index, so a rerun picks the same buyers.
+	DupRatio   float64 // share of buyers who double-click: same request, same key, 0–49 ms later, own connection
+	RetryRatio float64 // share of buyers who resend with the same key after their answer (simulated timeout)
+	Confirm    bool    // winners call POST /reservations/{id}/confirm (retried too, if selected for retry)
 }
 
 // Result is one burst run against one drop. Strategy and PoolSize are labels
@@ -56,11 +62,16 @@ type Result struct {
 	Stock    int    `json:"stock"`
 	DropID   int64  `json:"drop_id"`
 
-	Outcomes
-	// Retries performed by the client or a retrying strategy. Always 0 until
-	// retry simulation (milestone 4) / strategy D exist.
-	Retries    int `json:"retries"`
-	Duplicates int `json:"duplicates"`
+	Outcomes       // first attempt of every buyer; the latency figures below use only these
+	Retries    int `json:"retries"`    // same-key resends (reserve + confirm)
+	Duplicates int `json:"duplicates"` // double-click requests
+	// Extra covers the duplicate and retry reservation requests, so H1 also
+	// applies to them.
+	Extra   Outcomes     `json:"extra_requests"`
+	Confirm ConfirmStats `json:"confirm"`
+	// KeyViolations: one Idempotency-Key produced two *different* successful
+	// responses (e.g. two reservations). Must be 0; part of I3.
+	KeyViolations int `json:"key_violations"`
 
 	SetupMs        float64 `json:"setup_ms"` // time to open all connections
 	ElapsedMs      float64 `json:"elapsed_ms"`
@@ -89,6 +100,11 @@ func (r Result) Oversold() int {
 	return r.Invariants.Stats.Oversold()
 }
 
+// H1 covers every request the run sent, not only first attempts.
+func (r Result) H1() bool {
+	return r.Outcomes.H1() && r.Extra.H1() && r.Confirm.H1()
+}
+
 func (r Result) Violations() int {
 	if r.Invariants == nil {
 		return 0
@@ -113,9 +129,18 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	reserveURL := fmt.Sprintf("%s/drops/%d/reservations", cfg.BaseURL, dropID)
 
-	// --- setup: one pre-dialed connection and client per buyer ---
+	// Which buyers double-click, retry. Deterministic per index.
+	dupOf := map[int]int{} // buyer index -> extra connection index
+	for i := 0; i < cfg.Buyers; i++ {
+		if pick(i, cfg.DupRatio, 1) {
+			dupOf[i] = cfg.Buyers + len(dupOf)
+		}
+	}
+	res.Duplicates = len(dupOf)
+
+	// --- setup: one pre-dialed connection per buyer, plus one per duplicate ---
 	setupStart := time.Now()
-	clients, err := dialAll(ctx, u.Host, cfg.Buyers, cfg.DialConcurrency, cfg.ClientTimeout)
+	clients, err := dialAll(ctx, u.Host, cfg.Buyers+len(dupOf), cfg.DialConcurrency, cfg.ClientTimeout)
 	if err != nil {
 		return res, err
 	}
@@ -128,31 +153,83 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	// --- the burst ---
 	samples := make([]sample, cfg.Buyers)
+	bodies := make([][]byte, cfg.Buyers)
+	var extra, confirms []sample
+	var dupResults []dupResult
+	var mu sync.Mutex // guards extra, confirms and the counters below
+	keyViolations, retries := 0, 0
+	note := func(dst *[]sample, s sample) {
+		mu.Lock()
+		*dst = append(*dst, s)
+		mu.Unlock()
+	}
+	// sameEffect: two successful answers to one key must be identical.
+	sameEffect := func(a sample, aBody []byte, b sample, bBody []byte) {
+		if a.err == nil && b.err == nil && isSuccess(a.status) && isSuccess(b.status) &&
+			(a.status != b.status || !bytes.Equal(aBody, bBody)) {
+			mu.Lock()
+			keyViolations++
+			mu.Unlock()
+		}
+	}
+
 	var ready, done sync.WaitGroup
 	start := make(chan struct{})
 	var released time.Time // written before close(start), read after: safe
 	for i := 0; i < cfg.Buyers; i++ {
+		user := fmt.Sprintf("lg-%s-%d", cfg.RunID, i)
+		key := fmt.Sprintf("lg-%s-%d-k", cfg.RunID, i)
 		ready.Add(1)
 		done.Add(1)
 		go func(i int) {
 			defer done.Done()
-			// Build the request before the barrier so only the send is timed.
-			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, reserveURL, nil)
-			req.Header.Set("X-User-Id", fmt.Sprintf("lg-%s-%d", cfg.RunID, i))
-			req.Header.Set("Idempotency-Key", fmt.Sprintf("lg-%s-%d-k", cfg.RunID, i))
 			ready.Done()
 			<-start
+			s, body := send(ctx, clients[i], reserveURL, user, key, released)
+			samples[i], bodies[i] = s, body // each goroutine writes only its own index: no race
 
-			resp, err := clients[i].Do(req)
-			s := sample{err: err, start: released}
-			if err == nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-				s.status = resp.StatusCode
+			if pick(i, cfg.RetryRatio, 2) {
+				r, rBody := send(ctx, clients[i], reserveURL, user, key, time.Now())
+				note(&extra, r)
+				sameEffect(s, body, r, rBody)
+				mu.Lock()
+				retries++
+				mu.Unlock()
 			}
-			s.end = time.Now()
-			samples[i] = s // each goroutine writes only its own index: no race
+			if cfg.Confirm && s.err == nil && s.status == http.StatusCreated {
+				var hold struct {
+					ID int64 `json:"id"`
+				}
+				if json.Unmarshal(body, &hold) == nil {
+					confirmURL := fmt.Sprintf("%s/reservations/%d/confirm", cfg.BaseURL, hold.ID)
+					c, cBody := send(ctx, clients[i], confirmURL, user, key+"-confirm", time.Now())
+					note(&confirms, c)
+					if pick(i, cfg.RetryRatio, 3) {
+						c2, c2Body := send(ctx, clients[i], confirmURL, user, key+"-confirm", time.Now())
+						note(&confirms, c2)
+						sameEffect(c, cBody, c2, c2Body)
+						mu.Lock()
+						retries++
+						mu.Unlock()
+					}
+				}
+			}
 		}(i)
+
+		if j, ok := dupOf[i]; ok {
+			done.Add(1)
+			go func(i, j int) {
+				defer done.Done()
+				<-start
+				time.Sleep(time.Duration(i%50) * time.Millisecond) // "twice within 50 ms"
+				d, dBody := send(ctx, clients[j], reserveURL, user, key, time.Now())
+				note(&extra, d)
+				// Compare once the original has finished (done.Wait below).
+				mu.Lock()
+				dupResults = append(dupResults, dupResult{i, d, dBody})
+				mu.Unlock()
+			}(i, j)
+		}
 	}
 	ready.Wait()
 
@@ -169,11 +246,20 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	close(stopSampling)
 	<-samplingDone
 
+	for _, d := range dupResults {
+		sameEffect(samples[d.buyer], bodies[d.buyer], d.s, d.body)
+	}
+	res.KeyViolations = keyViolations
+	res.Retries = retries
+
 	// --- summarize ---
-	sum := summarize(samples, cfg.ClientTimeout+time.Second)
+	hung := cfg.ClientTimeout + time.Second
+	sum := summarize(samples, hung)
 	res.Outcomes = sum.Outcomes
 	res.ErrorSamples = sum.errorSamples
 	res.PeakInFlight = sum.peakInFlight
+	res.Extra = summarize(extra, hung).Outcomes
+	res.Confirm = summarizeConfirms(confirms, hung)
 	elapsed := sum.last.Sub(released)
 	res.ElapsedMs = ms(elapsed)
 	if elapsed > 0 {
@@ -187,6 +273,43 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	res.LatencySoldOut = Summarize(sum.soldOut)
 	res.SampledOversell = max(0, res.PeakActive-cfg.Stock)
 	return res, nil
+}
+
+type dupResult struct {
+	buyer int
+	s     sample
+	body  []byte
+}
+
+func isSuccess(status int) bool { return status >= 200 && status < 300 }
+
+// pick selects about ratio of all indexes, deterministically. salt makes the
+// duplicate, retry and confirm-retry selections independent of each other.
+func pick(i int, ratio float64, salt uint64) bool {
+	if ratio <= 0 {
+		return false
+	}
+	h := (uint64(i)+1)*0x9e3779b97f4a7c15 ^ salt*0xbf58476d1ce4e5b9
+	h ^= h >> 31
+	return float64(h%10000) < ratio*10000
+}
+
+// send POSTs with the buyer's headers and returns the sample and body. start
+// is when the request was meant to go out (see sample).
+func send(ctx context.Context, c *http.Client, url, user, key string, start time.Time) (sample, []byte) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	req.Header.Set("X-User-Id", user)
+	req.Header.Set("Idempotency-Key", key)
+	resp, err := c.Do(req)
+	s := sample{err: err, start: start}
+	var body []byte
+	if err == nil {
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		s.status = resp.StatusCode
+	}
+	s.end = time.Now()
+	return s, body
 }
 
 // sampleActive polls held + confirmed until stop is closed, plus once more

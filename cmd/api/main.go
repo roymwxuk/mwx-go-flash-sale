@@ -14,6 +14,7 @@ import (
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/config"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/db"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/httpapi"
+	"github.com/roymwxuk/mwx-go-flash-sale/internal/payment"
 	"github.com/roymwxuk/mwx-go-flash-sale/internal/sale"
 )
 
@@ -52,15 +53,24 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Mock provider with failure injection. Seeded from the clock: each run
+	// declines a different set of reservations at the configured rate.
+	payments := payment.NewMock(payment.MockConfig{
+		MinLatency:  cfg.PaymentMinLatency,
+		MaxLatency:  cfg.PaymentMaxLatency,
+		FailureRate: cfg.PaymentFailureRate,
+		Seed:        uint64(time.Now().UnixNano()),
+	})
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.New(pool, sale.NewService(pool, strategy, cfg.HoldTTL), log, cfg.RequestTimeout).Handler(),
+		Handler:           httpapi.New(pool, sale.NewService(pool, strategy, cfg.HoldTTL, payments), log, cfg.RequestTimeout).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr, "db_max_conns", cfg.DBMaxConns, "strategy", strategy.Name())
+		log.Info("listening", "addr", cfg.HTTPAddr, "db_max_conns", cfg.DBMaxConns, "strategy", strategy.Name(), "payment_failure_rate", cfg.PaymentFailureRate)
 		errCh <- srv.ListenAndServe()
 	}()
 

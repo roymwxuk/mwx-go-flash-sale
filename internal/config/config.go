@@ -28,6 +28,11 @@ type Config struct {
 
 	// HoldTTL is how long a reservation holds stock before it expires.
 	HoldTTL time.Duration
+
+	// Mock payment provider (failure injection).
+	PaymentMinLatency  time.Duration
+	PaymentMaxLatency  time.Duration
+	PaymentFailureRate float64
 }
 
 const defaultDatabaseURL = "postgres://flashsale:flashsale@localhost:5432/flashsale?sslmode=disable"
@@ -48,6 +53,9 @@ func load(getenv func(string) string) (Config, error) {
 		ShutdownTimeout: 10 * time.Second,
 		Strategy:        stringOr(getenv("STRATEGY"), "atomic"),
 		HoldTTL:         5 * time.Minute,
+
+		PaymentMinLatency: 100 * time.Millisecond,
+		PaymentMaxLatency: 300 * time.Millisecond,
 	}
 
 	if v := getenv("DB_MAX_CONNS"); v != "" {
@@ -68,6 +76,22 @@ func load(getenv func(string) string) (Config, error) {
 	if c.HoldTTL, err = durationOr(getenv, "HOLD_TTL", c.HoldTTL); err != nil {
 		return Config{}, err
 	}
+	if c.PaymentMinLatency, err = nonNegDurationOr(getenv, "PAYMENT_MIN_LATENCY", c.PaymentMinLatency); err != nil {
+		return Config{}, err
+	}
+	if c.PaymentMaxLatency, err = nonNegDurationOr(getenv, "PAYMENT_MAX_LATENCY", c.PaymentMaxLatency); err != nil {
+		return Config{}, err
+	}
+	if c.PaymentMaxLatency < c.PaymentMinLatency {
+		return Config{}, fmt.Errorf("PAYMENT_MAX_LATENCY must be >= PAYMENT_MIN_LATENCY")
+	}
+	if v := getenv("PAYMENT_FAILURE_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return Config{}, fmt.Errorf("PAYMENT_FAILURE_RATE must be between 0 and 1, got %q", v)
+		}
+		c.PaymentFailureRate = f
+	}
 	return c, nil
 }
 
@@ -86,6 +110,19 @@ func durationOr(getenv func(string) string, key string, def time.Duration) (time
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s must be a positive duration like 5s, got %q", key, v)
+	}
+	return d, nil
+}
+
+// nonNegDurationOr is like durationOr but allows 0 (e.g. no payment latency).
+func nonNegDurationOr(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
+	v := getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s must be a duration >= 0 like 100ms, got %q", key, v)
 	}
 	return d, nil
 }

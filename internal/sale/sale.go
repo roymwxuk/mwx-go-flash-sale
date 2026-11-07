@@ -4,14 +4,18 @@ package sale
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/roymwxuk/mwx-go-flash-sale/internal/payment"
 )
 
 // Domain errors. The HTTP layer maps these to status codes; errors.Is works
@@ -22,7 +26,26 @@ var (
 	ErrPerUserLimit   = errors.New("per-user limit reached")
 	ErrSaleNotStarted = errors.New("sale has not started")
 	ErrInvalidInput   = errors.New("invalid input")
+
+	// ErrIdempotencyMismatch: the key was already used for a different
+	// request (other endpoint, other drop or reservation, other quantity).
+	ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
+	ErrNotHeld             = errors.New("reservation is not held")
+	ErrHoldExpired         = errors.New("hold has expired")
+	// ErrPaymentPending: the provider's answer was lost (timeout, client
+	// gone). Retrying with the same Idempotency-Key is safe and finishes it.
+	ErrPaymentPending = errors.New("payment outcome unknown; retry with the same Idempotency-Key")
 )
+
+// Result is a successful (or stored) response, exactly as sent to the
+// client. Body is stored verbatim with the idempotency key, so a replay is
+// byte-for-byte identical to the original.
+type Result struct {
+	Status      int
+	Body        []byte
+	Replayed    bool
+	Reservation Reservation
+}
 
 type Drop struct {
 	ID           int64     `json:"id"`
@@ -56,10 +79,16 @@ type Service struct {
 	pool     *pgxpool.Pool
 	strategy StockStrategy
 	holdTTL  time.Duration
+	payments payment.Gateway
 }
 
-func NewService(pool *pgxpool.Pool, strategy StockStrategy, holdTTL time.Duration) *Service {
-	return &Service{pool: pool, strategy: strategy, holdTTL: holdTTL}
+// NewService wires the service. A nil gateway means an instant, always
+// approving mock, which is what most tests want.
+func NewService(pool *pgxpool.Pool, strategy StockStrategy, holdTTL time.Duration, payments payment.Gateway) *Service {
+	if payments == nil {
+		payments = payment.NewMock(payment.MockConfig{})
+	}
+	return &Service{pool: pool, strategy: strategy, holdTTL: holdTTL, payments: payments}
 }
 
 func (s *Service) Strategy() StockStrategy { return s.strategy }
@@ -136,46 +165,62 @@ func (s *Service) GetDrop(ctx context.Context, id int64) (DropState, error) {
 	return st, nil
 }
 
-// Reserve takes a hold of qty units for userID. See ADR-003 for the shape:
+const reserveEndpoint = "POST /drops/{id}/reservations"
+
+// Reserve takes a hold of qty units for userID, idempotently under key.
+// See ADR-003 (transaction shape) and ADR-005 (idempotency):
 //
-//  1. Pre-check without locks: not found, not started, over the per-user
-//     limit, or already sold out → reject without opening a transaction.
-//     A stale read here can only cause a too-early "sold out", never an
-//     oversell, because the real check happens in step 3.
-//  2. INSERT the reservation row. The partial UNIQUE index rejects a second
-//     active hold for the same (drop, user).
-//  3. strategy.Take on the hot drops row, as the last statement, so the row
-//     lock is held for as short a time as possible before COMMIT.
-func (s *Service) Reserve(ctx context.Context, dropID int64, userID string, qty int) (Reservation, error) {
-	if userID == "" {
-		return Reservation{}, fmt.Errorf("%w: user id is required", ErrInvalidInput)
+//  1. One lock-free read returns both the drop's pre-check fields and any
+//     stored response for this key. A stored key replays (or 422s on a
+//     different request). Not found, not started, over the per-user limit,
+//     or already sold out → reject without opening a transaction. Rejections
+//     have no side effect, so they are not stored and a retry re-evaluates.
+//  2. In one READ COMMITTED transaction: INSERT the idempotency key first.
+//     A concurrent request with the same key blocks on its unique index
+//     until we commit, then replays our response. INSERT the reservation
+//     (partial UNIQUE index enforces one active hold per user), store the
+//     response on the key, and take stock from the hot row last so its
+//     row lock is held as briefly as possible.
+func (s *Service) Reserve(ctx context.Context, dropID int64, userID string, qty int, key string) (Result, error) {
+	if err := validateCaller(userID, key); err != nil {
+		return Result{}, err
 	}
 	if qty < 1 {
-		return Reservation{}, fmt.Errorf("%w: quantity must be >= 1", ErrInvalidInput)
+		return Result{}, fmt.Errorf("%w: quantity must be >= 1", ErrInvalidInput)
 	}
+	hash := requestHash(reserveEndpoint, dropID, qty)
 
 	var limit, remaining int
 	var started bool
-	err := s.pool.QueryRow(ctx,
-		`SELECT per_user_limit, remaining, sale_starts_at <= now() FROM drops WHERE id = $1`, dropID,
-	).Scan(&limit, &remaining, &started)
+	var stored storedResponse
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.per_user_limit, d.remaining, d.sale_starts_at <= now(),
+		       k.request_hash, k.response_status, k.response_body
+		FROM drops d
+		LEFT JOIN idempotency_keys k ON k.user_id = $2 AND k.key = $3
+		WHERE d.id = $1`, dropID, userID, key,
+	).Scan(&limit, &remaining, &started, &stored.hash, &stored.status, &stored.body)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return Reservation{}, ErrNotFound
+		return Result{}, ErrNotFound
 	case err != nil:
-		return Reservation{}, fmt.Errorf("load drop: %w", err)
+		return Result{}, fmt.Errorf("load drop: %w", err)
+	case stored.hash != nil:
+		return stored.replay(hash)
 	case !started:
-		return Reservation{}, ErrSaleNotStarted
+		return Result{}, ErrSaleNotStarted
 	case qty > limit:
-		return Reservation{}, ErrPerUserLimit
+		return Result{}, ErrPerUserLimit
 	case remaining < qty:
-		return Reservation{}, ErrSoldOut
+		return Result{}, ErrSoldOut
 	}
 
-	var r Reservation
-	// BeginTxFunc commits if the callback returns nil and rolls back otherwise,
-	// so a sold-out Take also removes the reservation row inserted above.
+	var res Result
 	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if err := claimKey(ctx, tx, userID, key, reserveEndpoint, hash); err != nil {
+			return err
+		}
+		r := &res.Reservation
 		err := tx.QueryRow(ctx, `
 			INSERT INTO reservations (drop_id, user_id, quantity, expires_at)
 			VALUES ($1, $2, $3, now() + make_interval(secs => $4))
@@ -188,12 +233,23 @@ func (s *Service) Reserve(ctx context.Context, dropID int64, userID string, qty 
 		if err != nil {
 			return fmt.Errorf("insert reservation: %w", err)
 		}
+		res.Status = http.StatusCreated
+		if res.Body, err = json.Marshal(r); err != nil {
+			return err
+		}
+		if err := storeResponse(ctx, tx, userID, key, res.Status, res.Body); err != nil {
+			return err
+		}
 		return s.strategy.Take(ctx, tx, dropID, qty)
 	})
-	if err != nil {
-		return Reservation{}, err
+	if errors.Is(err, errKeyTaken) {
+		// Another request with this key committed first: replay its answer.
+		return s.replayStored(ctx, userID, key, hash)
 	}
-	return r, nil
+	if err != nil {
+		return Result{}, err
+	}
+	return res, nil
 }
 
 func isUniqueViolation(err error, constraint string) bool {

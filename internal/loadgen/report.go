@@ -210,7 +210,7 @@ func writeBurst(b *strings.Builder, runs []Result) {
 		if r.SampledOversell > 0 {
 			i1 = fmt.Sprintf("FAIL (oversold by %d mid-run)", r.SampledOversell)
 		}
-		fmt.Fprintf(b, "- Invariants: I1 %s, %d mid-run samples, peak active %d · I2 %s · I3 %s · I4 n/a (no expiry until M5) · I5 %s · H1 %s\n",
+		fmt.Fprintf(b, "- Invariants: I1 %s, %d mid-run samples, peak active %d · I2 %s · I3 %s · I4 n/a here (no hold expires during a burst; see sweeper tests) · I5 %s · H1 %s\n",
 			i1, r.Samples, r.PeakActive,
 			invStatus(r.Invariants, invariants.PerUserLimit),
 			i3Status(r),

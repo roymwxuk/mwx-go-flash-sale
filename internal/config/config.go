@@ -29,6 +29,11 @@ type Config struct {
 	// HoldTTL is how long a reservation holds stock before it expires.
 	HoldTTL time.Duration
 
+	// Expiry sweeper (runs inside every API instance; safe with N of them).
+	SweepInterval time.Duration
+	SweepBatch    int
+	KeyTTL        time.Duration
+
 	// Mock payment provider (failure injection).
 	PaymentMinLatency  time.Duration
 	PaymentMaxLatency  time.Duration
@@ -54,6 +59,10 @@ func load(getenv func(string) string) (Config, error) {
 		Strategy:        stringOr(getenv("STRATEGY"), "atomic"),
 		HoldTTL:         5 * time.Minute,
 
+		SweepInterval: time.Second,
+		SweepBatch:    500,
+		KeyTTL:        24 * time.Hour,
+
 		PaymentMinLatency: 100 * time.Millisecond,
 		PaymentMaxLatency: 300 * time.Millisecond,
 	}
@@ -75,6 +84,19 @@ func load(getenv func(string) string) (Config, error) {
 	}
 	if c.HoldTTL, err = durationOr(getenv, "HOLD_TTL", c.HoldTTL); err != nil {
 		return Config{}, err
+	}
+	if c.SweepInterval, err = durationOr(getenv, "SWEEP_INTERVAL", c.SweepInterval); err != nil {
+		return Config{}, err
+	}
+	if c.KeyTTL, err = durationOr(getenv, "IDEMPOTENCY_KEY_TTL", c.KeyTTL); err != nil {
+		return Config{}, err
+	}
+	if v := getenv("SWEEP_BATCH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("SWEEP_BATCH must be a positive integer, got %q", v)
+		}
+		c.SweepBatch = n
 	}
 	if c.PaymentMinLatency, err = nonNegDurationOr(getenv, "PAYMENT_MIN_LATENCY", c.PaymentMinLatency); err != nil {
 		return Config{}, err

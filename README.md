@@ -2,7 +2,7 @@
 
 A flash-sale API for limited drops (event tickets, limited fan goods) in Go and PostgreSQL. It is built to **prove, with measured numbers, that it never oversells**: 10,000 buyers hit 100 units at the same instant, and no stock is oversold, no buyer is charged twice, and expired holds are released exactly once.
 
-> **Status: milestone 4 + strategy C.** Three stock strategies (A naive, B atomic, C pessimistic), idempotency keys, confirm with a mock payment provider (failure injection), an invariant checker, barrier-start concurrency tests, and an HTTP load generator (burst, messy-client, and capacity-ceiling scenarios). Next: the expiry sweeper (`SKIP LOCKED`, several instances), then the main "largest-community drop" scenario L2 (milestone 5).
+> **Status: milestone 5 core.** Three stock strategies (A naive, B atomic, C pessimistic), idempotency keys, confirm with a mock payment provider (failure injection), an expiry sweeper safe with N instances, an invariant checker, barrier-start concurrency tests, and an HTTP load generator (burst, messy-client, and capacity-ceiling scenarios). Next: CI (milestone 6) and README polish (milestone 7).
 
 ## Headline results: 10,000 buyers vs 100 units over HTTP
 
@@ -36,7 +36,7 @@ What the numbers say:
 | 1 | No oversell | Query shape: `UPDATE ... WHERE remaining >= n` (B) or a `FOR NO KEY UPDATE` row lock (C), plus `CHECK (remaining >= 0)` | `TestConcurrentCorrectStrategiesNeverOversell` (B, C); `TestConcurrentNaiveOversells` shows the failure mode |
 | 2 | Per-user limit | Partial UNIQUE index on `(drop_id, user_id) WHERE status IN ('held','confirmed')` | `TestConcurrentSameUserGetsOneHold` (50 concurrent requests from one user → 1 hold, under both strategies) |
 | 3 | No double charge | `payments.reservation_id UNIQUE`; provider idempotency key = reservation id; `Idempotency-Key` stored in the same transaction as the effect | `TestConcurrentConfirmChargesOnce` (40 concurrent confirms → 1 payment, 1 charge), `TestConfirmRetryAfterTimeoutDoesNotDoubleCharge`, `TestIdempotentReserveConcurrentSameKey` (50 same-key requests → 1 hold, 50 identical responses); `make load-messy` (0 key violations) |
-| 4 | Exactly-once release | _milestone 5 (sweeper with `SKIP LOCKED`)_ | _milestone 5_ |
+| 4 | Exactly-once release | Sweeper claims holds with `FOR UPDATE SKIP LOCKED`, transitions `held→expired` and refunds in one statement guarded by `status='held'`; `CHECK (remaining <= total_stock)` rejects over-refunds; confirm extends `expires_at` so a paying hold is never expired | `TestConcurrentSweepersReleaseEachHoldOnce` (3 sweepers, 200 holds, 10/10 runs exact), `TestConfirmRacingSweeper` (150 confirms around expiry, 10/10 runs, 0 charged-but-expired), `TestPoisonedDropDoesNotBlockOthers` |
 | 5 | Stock conservation | Checked by `internal/invariants` after every test run; declined payments release stock with a conditional `UPDATE ... WHERE status='held'` (exactly once) | all concurrency tests; `TestConcurrentDeclinedConfirmReleasesOnce`; `TestCheckerDetectsEachViolation` tests the checker itself |
 
 ## API
@@ -84,6 +84,9 @@ Configuration (environment variables):
 | `SHUTDOWN_TIMEOUT` | `10s` | graceful shutdown limit |
 | `PAYMENT_MIN_LATENCY` / `PAYMENT_MAX_LATENCY` | `100ms` / `300ms` | mock payment provider latency (uniform) |
 | `PAYMENT_FAILURE_RATE` | `0` | share of payments the mock declines (failure injection) |
+| `SWEEP_INTERVAL` | `1s` | how often each instance's sweeper looks for expired holds |
+| `SWEEP_BATCH` | `500` | holds per sweeper statement (per drop) |
+| `IDEMPOTENCY_KEY_TTL` | `24h` | idempotency keys older than this are deleted by the sweeper |
 | `PG_PORT` | `5432` | host port for the compose Postgres (Makefile) |
 
 ## Design decisions
@@ -96,6 +99,7 @@ See [`docs/decisions.md`](docs/decisions.md):
 - ADR-005: idempotency keys (key claimed inside the effect's transaction; only successes stored)
 - ADR-006: confirm and mock payment (re-runnable state machine; a stale-join bug under READ COMMITTED, found and fixed)
 - ADR-007: choosing the stock strategy: B over C, with measured numbers; `FOR UPDATE` vs foreign-key deadlock, found and fixed
+- ADR-008: expiry sweeper (`SKIP LOCKED`, exactly-once in three layers; a confirm-vs-sweeper race and a poisoned-drop stall, found and fixed)
 
 ## Why `go test -race` is not enough
 

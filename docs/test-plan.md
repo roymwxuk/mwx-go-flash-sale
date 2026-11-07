@@ -132,8 +132,8 @@ Invariants: I1 <ok/n> · I2 <> · I3 <> · I4 <> · I5 <> · H1 <>
 | C4 | ✅ done (quantity, drop, and endpoint mismatches) | `TestIdempotencyKeyReuseWithDifferentRequest` |
 | C5 | ✅ done | `TestPaymentFailureReleasesHold`, `TestConcurrentDeclinedConfirmReleasesOnce` |
 | C6 | ✅ done (20 same-key + 20 different-key confirms; retry after a timeout mid-payment) | `TestConcurrentConfirmChargesOnce`, `TestConfirmRetryAfterTimeoutDoesNotDoubleCharge` |
-| C7 | ⏳ milestone 5 (expiry sweeper) | |
-| C8 | ✅ done (hold past `expires_at` → 410, nothing charged; also needs the sweeper case in milestone 5) | `TestConfirmAfterExpiryIsRejected` |
+| C7 | ✅ done (3 sweepers, batch size 7; 10/10 repeated runs) | `internal/sweeper/sweeper_test.go`: `TestConcurrentSweepersReleaseEachHoldOnce`; also `TestConfirmRacingSweeper`, `TestSweeperSkipsPendingPayment`, `TestPoisonedDropDoesNotBlockOthers` |
+| C8 | ✅ done (hold past `expires_at` → 410, nothing charged; also when the sweeper expires it mid-confirm) | `TestConfirmAfterExpiryIsRejected`, `TestConfirmRacingSweeper` |
 | C9 | ✅ done | `TestConcurrentSoldOutIsConsistent` |
 | C10 | optional, after milestone 5 | |
 | L1 | ✅ done, including H1, mid-run I1 sampling, per-outcome latency, peak in-flight, git commit | `make load` → `docs/results.md` |
@@ -143,6 +143,6 @@ Invariants: I1 <ok/n> · I2 <> · I3 <> · I4 <> · I5 <> · H1 <>
 | L5 | ✅ done | `make load-ceiling` → `docs/results.md` |
 | L7 | ⏳ milestone 5 (pool-size comparison); `-pool` already exists | |
 | L8 | optional | |
-| I4 | reported as "n/a" until the sweeper exists | |
+| I4 | ✅ covered by the sweeper tests (C7, the confirm race, mutation checks); in load bursts it is "n/a" because no 5-minute hold expires during a run | `docs/results.md` 16:30 |
 
 **Note on section 6 (found while running L5):** L5 as specified keeps stock from selling out, so it measures the *write* path (about 500 req/s ceiling here). The modeled L2 peak of about 5,000 req/s is mostly *sold-out* traffic, which only needs the lock-free pre-check, and L1 measured that path at 4,422–7,489 req/s. Comparing L5's ceiling directly with L2's peak would understate capacity. Proposal: judge the main scenario by L2 itself, and keep L5 as the write-path ceiling. A pgbench baseline shows the single row alone handles about 4,900 updates/s in the same VM (see `docs/results.md`).

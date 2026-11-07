@@ -15,7 +15,8 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.HTTPAddr != ":8080" || c.DBMaxConns != 20 || c.RequestTimeout != 5*time.Second ||
-		c.Strategy != "atomic" || c.HoldTTL != 5*time.Minute {
+		c.Strategy != "atomic" || c.HoldTTL != 5*time.Minute ||
+		c.SweepInterval != time.Second || c.SweepBatch != 500 || c.KeyTTL != 24*time.Hour {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 }
@@ -48,6 +49,7 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		"non-numeric":      {"DB_MAX_CONNS": "lots"},
 		"bad duration":     {"REQUEST_TIMEOUT": "5"},
 		"failure rate > 1": {"PAYMENT_FAILURE_RATE": "1.5"},
+		"zero sweep batch": {"SWEEP_BATCH": "0"},
 		"max < min":        {"PAYMENT_MIN_LATENCY": "300ms", "PAYMENT_MAX_LATENCY": "100ms"},
 		"negative timeout": {"SHUTDOWN_TIMEOUT": "-1s"},
 	}

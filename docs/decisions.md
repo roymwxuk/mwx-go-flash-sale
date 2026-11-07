@@ -6,7 +6,7 @@ Short ADRs: context, options, decision, why, trade-offs. Newest at the bottom.
 
 ## ADR-001: Schema and where each invariant is enforced
 
-**Status:** accepted (milestone 1). Will be refined as strategies land.
+**Status:** accepted (milestone 1). Refined through milestone 5: the per-drop sweeper and confirm's `expires_at` extension (ADR-008) are the parts added later.
 
 ### Context
 The project has to prove five invariants under concurrent load: no oversell, per-user limit, no double charge, exactly-once release, and stock conservation. Application code can be raced, but database constraints cannot. So any invariant that can be expressed as a constraint should be one.
@@ -31,7 +31,7 @@ Identifiers are `BIGINT GENERATED ALWAYS AS IDENTITY`: compact, ordered, and goo
 | 1. No oversell | Query shape of the stock strategy (atomic `UPDATE ... WHERE remaining >= n`, or a row lock), backed by `CHECK (remaining >= 0)`. |
 | 2. Per-user limit | Partial UNIQUE index: one active reservation per (drop, user). `quantity <= per_user_limit` is checked inside the reservation INSERT. |
 | 3. No double charge | `payments.reservation_id UNIQUE` + `payments.idempotency_key UNIQUE`. |
-| 4. Exactly-once release | Sweeper changes `held → expired` with `FOR UPDATE SKIP LOCKED` and returns stock in the same transaction (milestone 5). The status transition happens only once. |
+| 4. Exactly-once release | Sweeper changes `held → expired` with `FOR UPDATE SKIP LOCKED` and returns stock in the same statement, guarded by `status = 'held'`; `CHECK (remaining <= total_stock)` rejects an over-refund (ADR-008). |
 | 5. Conservation | Checked after every run by `internal/invariants` (milestone 2). |
 
 ### Why the CHECK does not hide strategy A's bug
@@ -84,7 +84,7 @@ type StockStrategy interface {
     Take(ctx context.Context, tx pgx.Tx, dropID int64, n int) error // ErrSoldOut if < n left
 }
 ```
-The strategy is chosen with `STRATEGY=naive|atomic`. `sale.Service.Reserve` owns everything else, so every strategy runs inside the same flow:
+The strategy is chosen with `STRATEGY=naive|atomic|pessimistic`. `sale.Service.Reserve` owns everything else, so every strategy runs inside the same flow:
 
 1. **Lock-free pre-check** (no transaction): drop exists, sale started, `qty <= per_user_limit`, `remaining >= qty`. Otherwise it rejects immediately.
 2. `BEGIN` (READ COMMITTED)
@@ -112,9 +112,9 @@ The strategy is chosen with `STRATEGY=naive|atomic`. `sale.Service.Reserve` owns
 | A naive | READ COMMITTED | The production default. We want to show the bug that real code with default settings has. |
 | B atomic | READ COMMITTED | Correct as described above. A stronger level would add serialization failures and retries for no gain. |
 | C pessimistic | READ COMMITTED | The explicit row lock (`FOR NO KEY UPDATE`, see ADR-007) gives the guarantee. |
-| D optimistic (later) | READ COMMITTED | The version column gives the guarantee, and conflicts are retried in app code. |
+| D optimistic (cut) | READ COMMITTED | Would rely on the version column, with conflicts retried in app code. Not built (ADR-007). |
 
-**Rejected: SERIALIZABLE for everything.** It would make A correct too, but by aborting conflicting transactions (`40001`), which then need retry loops. On a single hot row almost every transaction conflicts, so throughput would collapse into retries. This is a candidate for an extra measured comparison if time allows.
+**Rejected: SERIALIZABLE for everything.** It would make A correct too, but by aborting conflicting transactions (`40001`), which then need retry loops. On a single hot row almost every transaction conflicts, so throughput would collapse into retries. This is reasoning, not a measurement: a SERIALIZABLE run was not done within the time budget.
 
 ### Error mapping (HTTP)
 | Error | Status |
@@ -127,7 +127,7 @@ The strategy is chosen with `STRATEGY=naive|atomic`. `sale.Service.Reserve` owns
 ### Trade-offs
 - Inserting before decrementing means sold-out buyers who pass the stale pre-check do a wasted INSERT and rollback. That is cheap and only happens in the instant around sell-out.
 - Rolled-back INSERTs consume identity values, so reservation IDs have gaps. That is harmless.
-- `Idempotency-Key` is required by the API now but not stored until milestone 4.
+- `Idempotency-Key` is stored inside the same transaction (ADR-005).
 
 ---
 
@@ -146,7 +146,7 @@ The load test must show what happens when 10,000 buyers arrive *at the same inst
 4. **The DB is the referee.** "Oversold" in the results comes from `invariants.Check` against Postgres, not from counting HTTP 201s.
 5. **`SO_LINGER=0` on client sockets.** Closing 10,000 sockets normally leaves them in TIME_WAIT (~30 s on macOS). The ephemeral range is only 16,384 ports, and the second run in our first attempt failed with `can't assign requested address`. Linger 0 closes with RST, which is fine for a load generator and wrong for a real client.
 6. **Timeouts:** server `REQUEST_TIMEOUT` = 5 s (pool wait included, then 503). Client timeout = 30 s, so a server 503 is recorded as a 503, not as a client timeout.
-7. **Exit code:** 1 if any strategy except `naive` violates an invariant. Naive is expected to fail. CI (milestone 6) relies on this.
+7. **Exit code:** 1 if any strategy except `naive` violates an invariant, or if H1 fails. Naive is expected to fail. This is what a CI smoke test would gate on (CI is not built yet; see the README's limitations).
 
 ### Trade-offs and limits
 - The client, API, and Postgres share one laptop. The load generator's 10,000 goroutines compete for the same CPU as the API. Numbers are for comparison, not capacity.
@@ -181,7 +181,7 @@ Clients time out and retry, and users double-click. Every reservation and confir
 - **Only successful effects are stored.** Validation errors, not found, sale not started, sold out, and per-user limit are *not* stored. They had no side effect, so re-running them is harmless, and storing them would add a write to the sold-out path, which carries 99% of flash-sale traffic. Consequence (tested by `TestRejectionsAreNotStored`): a sold-out answer under key K doesn't stick to K, so if a declined payment returns a unit, retrying K can succeed. For a buyer, that's the desirable behavior.
 - **Replays** are byte-identical and carry `Idempotent-Replayed: true`.
 - **Confirm** uses the same table, but can't keep a transaction open across the payment call (ADR-006). It stores the final response after the payment settles. Its correctness doesn't depend on the key at all (confirm is idempotent by state), so a duplicate that slips past the key check just re-drives the same state machine to the same answer.
-- **TTL:** keys are meant to live for 24 h. Deleting old keys is a job for the background worker in milestone 5. Until then, keys don't expire.
+- **TTL:** 24 h (`IDEMPOTENCY_KEY_TTL`). The expiry sweeper (ADR-008) deletes older keys on each tick. A retry after the TTL is treated as a new request; for reserve that is safe, because the per-user UNIQUE index still allows only one active hold.
 
 ### Evidence
 - `TestIdempotentReserveConcurrentSameKey` (C3): 50 identical requests at the same instant give 1 reservation, 50 byte-identical responses, and 49 replays, under both strategies. A mutation test (removing the key claim) makes it fail.
@@ -220,7 +220,7 @@ Calling Confirm again, concurrently or later, just drives the same reservation t
 | Provider call times out or the client disconnects | Payment stays `pending`. The API answers **503 `payment_pending`**: retry with the same key. The retry asks the provider again with the same provider key and gets the recorded outcome, with no second charge. |
 | Client disconnects *after* the provider answered | tx2 runs with `context.WithoutCancel` plus a 5 s timeout, so the DB records what the provider did even though nobody is listening. |
 | Hold expired before confirm | 410 `hold_expired`, nothing charged (C8). |
-| Hold expires *while* a payment is pending | Confirm resumes it (the money may have moved). The milestone 5 sweeper must skip reservations with a pending payment. |
+| Hold expires *while* a payment is pending | Confirm resumes it (the money may have moved). The sweeper never expires a reservation with a pending payment, and confirm extends `expires_at` when it starts paying (ADR-008). |
 | Another user's reservation | 404, so other users' reservation IDs aren't revealed. |
 
 ### The mock provider
@@ -310,3 +310,53 @@ The first version released one batch across all drops, ordered by expiry. Run li
 - Expired stock comes back up to `SWEEP_INTERVAL` late (1 s). Fine for 5–10 minute holds.
 - The refund UPDATE takes the drop's hot-row lock briefly. One statement per 500 holds keeps that rare.
 - Clock source: `expires_at` and `now()` both come from the DB clock, so app-server clock skew doesn't matter. The tests measure host-to-DB skew (about 13 ms here) only to schedule confirms "around expiry".
+
+---
+
+## ADR-009: Connection pool sizing and behavior under pool exhaustion
+
+**Status:** accepted (milestone 7). The planned comparison of two pool sizes was **cut** for time, per the project's cut order. Everything below is either measured at pool 20 or marked as unmeasured.
+
+### Context
+10,000 buyers arrive at once, and each request needs a database connection for at least one query. Postgres can't take 10,000 connections (each is a backend process), and on one hot row extra connections add queueing, not throughput. So most requests have to wait for a connection, and that wait must end in an answer, never a hang.
+
+### Decision
+- **`DB_MAX_CONNS` = 20** (pgxpool `MaxConns`). It's about 10× the DB VM's 2 CPUs. That's enough to keep the CPUs busy while some connections wait on network round trips, and small enough that the queue lives in the API, where a deadline can cut it short.
+- **Every request has one deadline, `REQUEST_TIMEOUT` = 5 s, and the pool wait counts toward it.** `httpapi.withTimeout` puts the deadline on the request context. `pgxpool.Acquire` and every query honour it. `context.DeadlineExceeded` and pgconn timeouts map to **503 `timeout`** ("retry with the same Idempotency-Key"), never to a 500 and never to a hang.
+- Postgres `max_connections` is raised to 300 in `docker-compose.yml`, so pools above 100 could be tried without hitting the server's limit.
+- Confirm's final DB write runs after the payment call, on `context.WithoutCancel` with its own 5 s timeout (ADR-006). The DB records the provider's outcome even when the client's deadline has already passed.
+
+### What the measurements show (pool 20 only, `docs/results.md`)
+- **Exhaustion ends in a 503, never a hang.** The naive strategy saturates the pool: lost updates keep stock "available", so thousands of transactions queue on the hot row. That produced 4,361–6,257 503s per run (16:14 run), with p95 capped at about 5.2 s by the deadline, 0 transport errors and 0 hung requests (H1 ok).
+- **With the atomic strategy and 20 connections, 10,000 buyers caused no 503s** in any burst run. The cost shows up as latency: p50 0.95–2.55 s for all requests, while winners (201) had p95 0.42–0.88 s.
+- **Write-path ceiling at pool 20:** 500–750 req/s, depending on the session (L5). Postgres alone, in the same VM, ran 4,926 single-row updates/s (pgbench, 20 clients). Going from 1 to 20 pgbench clients *lowered* tps (6,195 → 4,926). More connections on one row add contention, not capacity.
+
+### Not measured
+- *Hypothesis:* most of the burst latency is time spent waiting for one of 20 connections, not time spent waiting for the row lock. A larger pool would then lower sold-out latency but not the write ceiling. The pgbench result suggests a larger pool could even lower the ceiling. Testing this is one command (`make load POOL=50`, then `POOL=100`). It was cut, not forgotten.
+
+### Trade-offs
+- A small pool makes the *losers* wait. The fix isn't a bigger pool. It's to answer sold-out without a connection (ADR-010).
+- A single 5 s deadline is simple but blunt. A production system would give pool acquisition a much shorter budget (e.g. 500 ms), so it sheds load sooner, and would return `Retry-After`.
+
+---
+
+## ADR-010: The hot row at 100× scale (written discussion, not built)
+
+**Status:** discussion only, as the project scope requires. Nothing here is implemented or measured.
+
+### Context
+Every buyer of a drop updates one row, `drops.remaining`. Writes to that row are serialized, and the measured write ceiling was 500–750 req/s on a laptop (ADR-007, ADR-009). What would change at 100× the traffic (about 1,000,000 buyers for a drop)?
+
+### Which path actually gets hot
+A 100-unit drop has only about 100 successful writes, plus a few resales after expiry or a declined payment. At 100×, almost all the extra traffic is **sold-out reads**, plus a short write burst at the start for large drops. So the first limit isn't the row lock. It's connections: every sold-out answer still takes a pool connection for one query.
+
+### What I would change, in order
+1. **Answer sold-out without the database.** Cache a "sold out" flag per drop in each API process (or a shared cache), refreshed every 100–500 ms, and checked before acquiring a connection. A stale "available" only costs one extra DB trip, because the atomic UPDATE stays the real guard. A stale "sold out" only delays a resale by the refresh interval. This removes about 99% of DB load in the burst.
+2. **Shorten the lock hold.** Do the reserve in one round trip: INSERT reservation + UPDATE stock + store idempotency key in one CTE, or in a stored function. Commit with no network trip between UPDATE and COMMIT. The measured gap between our path (about 550 req/s) and bare Postgres (4,926 tx/s) is mostly round trips made while holding the lock.
+3. **Admission control / waiting room** in front of the reserve endpoint: let buyers in at the rate the stock row can absorb, and hand out queue positions to the rest. The L5 overload result (goodput *falling* from 750 to about 540 req/s past the ceiling) is the reason: without admission control, overload does less useful work, not just slower work.
+4. **Stock buckets (sharded counters) for large drops:** split `remaining` across N rows (for example 16) and take from a random bucket, falling back to the others when it's empty. Write throughput scales roughly with N. The costs: "sold out" now needs every bucket to be empty, conservation checks sum N rows, and the fallback path adds latency near sell-out. Only worth it when the *write* rate is the limit, i.e. drops of thousands of units.
+5. **Queue-based allocation** (accept requests into a durable queue, and let one consumer decide winners in order). It's fair and has no contention, but the answer becomes asynchronous, which changes the API and the UX. It's the right model when "who arrived first" must be exact.
+
+### What I would *not* do
+- Move stock into an in-memory store as the source of truth. That creates a second system that must agree with Postgres about money and stock. The cache in (1) only *answers no*, so it can never cause an oversell.
+- Switch to SERIALIZABLE or optimistic retries. On one hot row nearly every transaction conflicts, so retries multiply load exactly at the peak (ADR-003, ADR-007).

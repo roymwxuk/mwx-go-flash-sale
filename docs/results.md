@@ -2,6 +2,24 @@
 
 Every number in the README must appear here first. `make load` (`cmd/loadgen`) appends one section per invocation with the machine spec. Raw JSON for each invocation goes to `results/` (gitignored).
 
+## Summary: where each README number comes from
+
+All runs were on one machine: Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.2, Go 1.26.5, PostgreSQL 16.15 in a Docker VM (2 CPU / 1.9 GB). Ranges are min–max across runs.
+
+| Claim | Number | Section below |
+|---|---|---|
+| In-process: A oversells, B does not (1,000 goroutines vs 10 units) | A oversold 10/10 runs (511–718 units); B exactly 10 holds 10/10 | 2026-11-07, milestone 2 |
+| HTTP burst, 10,000 buyers vs 100 units, pool 20 (headline table) | A oversold 1,142–1,499; B and C exactly 100, 0 violations | L1 burst 16:14 |
+| B vs C write-path ceiling, same session | B 750 req/s (2/2 runs); C 500 and 250 req/s | L5 16:15 |
+| B write-path ceiling, earlier sessions | 500 req/s (before and after milestone 4) | L5 15:27, L5 16:01 |
+| Postgres alone, one hot row (pgbench) | 6,195 tps (1 client), 4,926 tps (20 clients) | supporting measurement 15:29 |
+| Burst throughput, B (almost all sold-out answers) | 4,422–7,489 req/s | L1 burst 15:26 |
+| Messy clients (10% double-click, 30% retry, 5% declined) | about 14,160 req/run, 0 key violations, exactly 100 holds | L1 burst 16:01 |
+| Sweepers: 3 sweepers, 200 expired holds | exactly 200 released, 10/10 runs | Expiry sweeper 16:30 |
+| Confirm racing the sweeper, 150 confirms | 0 charged-but-expired, 10/10 runs | Expiry sweeper 16:30 |
+
+**Not measured (cut for time):** pool-size comparison (ADR-009), strategy D (ADR-007), SERIALIZABLE (ADR-003). CI has not been built yet.
+
 ---
 
 ## 2026-11-07: In-process concurrency test, strategy A vs B (milestone 2)
@@ -67,7 +85,7 @@ Violations for **naive** (drop 9):
 **Analysis (written by hand, from the table above):**
 - **Correctness:** atomic (B) granted exactly 100 holds in 3/3 runs, with 0 violations, 0 503s, and 0 errors. Naive (A) oversold in 3/3 runs, by 1,470–1,958 units: 15–20× the stock.
 - **Naive is also the slowest.** Its p95 of about 5.2 s equals the API's 5 s `REQUEST_TIMEOUT`, and 1,600–3,792 requests per run got 503. Lost updates keep `remaining` high for longer (sell-out took 2.8–3.5 s vs 0.4–0.76 s for atomic). So the lock-free pre-check keeps admitting buyers, and each one opens a transaction that queues on the hot row while holding one of the 20 pool connections. Everyone else then waits for a connection until the deadline. The 503s show the intended behavior under pool exhaustion: a timeout, not a hang.
-- **Atomic latency** was p50 0.71–1.28 s and p95 1.26–2.54 s, at 3,568–6,954 req/s. Every request needs at least one query, and 10,000 requests share 20 connections to a Postgres in a 2-CPU VM. *Hypothesis, not yet measured:* most of this latency is waiting for a pool connection rather than waiting for the row lock. The pool-size comparison (milestone 5) will test it.
+- **Atomic latency** was p50 0.71–1.28 s and p95 1.26–2.54 s, at 3,568–6,954 req/s. Every request needs at least one query, and 10,000 requests share 20 connections to a Postgres in a 2-CPU VM. *Hypothesis, not measured:* most of this latency is waiting for a pool connection rather than waiting for the row lock. The pool-size comparison that would test it was cut for time (ADR-009).
 - **Variance:** atomic throughput varied about 2× across runs on the same laptop. Treat the numbers as relative (A vs B on the same machine and the same minute), not as capacity figures.
 
 ---

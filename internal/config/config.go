@@ -14,7 +14,7 @@ type Config struct {
 	HTTPAddr    string
 
 	// DBMaxConns is the pgxpool MaxConns. It is deliberately much smaller than
-	// the number of concurrent buyers; see the pool-sizing ADR (milestone 5).
+	// the number of concurrent buyers; see ADR-009 in docs/decisions.md.
 	DBMaxConns int32
 
 	// RequestTimeout bounds every request, including the time spent waiting

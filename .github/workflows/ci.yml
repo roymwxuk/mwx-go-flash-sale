@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A newer push to the same branch cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet, staticcheck, race tests, load smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: make vet
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+      # The same Postgres the README uses (`make up`): Postgres 16 via docker
+      # compose, with max_connections=300. A GitHub service container can't
+      # pass `-c` flags to postgres, and parallel test packages each open
+      # their own pools.
+      - name: Start Postgres (make up)
+        run: make up
+
+      - name: go test -race ./...
+        run: make test
+
+      # Load smoke test: 1,000 buyers released at once against 10 units,
+      # strategy B (atomic). loadgen exits 1 on any invariant violation or
+      # H1 failure (5xx other than 503, transport error, hung request),
+      # which fails the build.
+      - name: Load smoke test (1,000 buyers vs 10 units, strategy B)
+        run: |
+          make build
+          ./bin/loadgen -scenario burst -api-bin bin/api -strategies atomic \
+            -buyers 1000 -stock 10 -pool 20 -repeat 1 -results-md ""
+
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker compose logs postgres

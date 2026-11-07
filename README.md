@@ -13,7 +13,7 @@ Test plan scenario **L1** ([`docs/test-plan.md`](docs/test-plan.md)). Every buye
 | A. naive read-then-write | **1,444–2,016** | 1,544–2,116 | 3,067–5,860 | 4.42–5.19 s | 5.20–5.29 s* | 5.20–5.29 s* | 2.62–3.61 s | 1,889–1,921 req/s | ok |
 | B. atomic conditional UPDATE | **0** | **exactly 100** | 0 | 0.74–1.15 s | 1.20–2.13 s | 1.31–2.23 s | 0.37–0.60 s | 4,422–7,489 req/s | ok |
 
-Latency covers every response (201, 409, 503). \*Capped by the API's 5 s `REQUEST_TIMEOUT`: slower requests were cut off as 503, so naive's true tail is worse. H1 = no 5xx except 503, no hung requests, no transport errors.
+Latency covers every response (201, 409, 503). \*Capped by the API's 5 s `REQUEST_TIMEOUT`: slower requests were cut off as 503 (Service Unavailable), so naive's true tail is worse. H1 = no 5xx except 503, no hung requests, no transport errors.
 
 **Capacity ceiling (scenario L5, strategy B):** **500 req/s** of reservation *writes* (stock never sells out) with p99 ≤ 500 ms. At 1,000 req/s the server completed about 554 req/s and the queue grew. For comparison, Postgres alone updated the same kind of single hot row at 4,926 tx/s (pgbench, 20 clients), so the limit is the reserve path's round trips while holding the row lock, not the row. Details in `docs/results.md`.
 
